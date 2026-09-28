@@ -1,0 +1,6 @@
+{
+  "id": "paseo-loom",
+  "requirements": {
+    "paseo": ">=0.9.1"
+  }
+}
