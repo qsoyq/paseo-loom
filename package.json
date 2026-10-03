@@ -1,12 +1,14 @@
 {
   "name": "paseo-loom",
   "private": true,
+  "type": "module",
   "version": "0.0.0",
   "files": [
     "paseo-plugin.json",
     "index.server.ts"
   ],
   "scripts": {
+    "test": "node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

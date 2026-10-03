@@ -29,6 +29,8 @@ type AgentInvocation = {
   sourceTask?: string;
   sourceTaskReady?: boolean;
   sourceSubscription?: PaseoAgentTimelineSubscription;
+  archiveRequested?: boolean;
+  archived?: boolean;
   abort: AbortController;
   phase: "waiting" | "requested" | "started" | "unknown" | "finished";
 };
@@ -82,6 +84,11 @@ function renderPrompt(template: string, invocation: AgentInvocation) {
   );
 }
 
+function needsSourceTask(configuration: LoomConfiguration) {
+  return configuration.prompt.includes("{{source_agent_id}}") ||
+    configuration.prompt.includes("{{task_prompt}}");
+}
+
 export default function contribute(server: PluginServerContext) {
   const invocations = new Map<string, AgentInvocation>();
   let stopped = false;
@@ -107,7 +114,12 @@ export default function contribute(server: PluginServerContext) {
   }
 
   function selectSource(invocation: AgentInvocation, agent: PluginHookAgent) {
-    if (invocation.phase !== "waiting" || agent.id === invocation.agentId) {
+    if (
+      invocation.phase !== "waiting" ||
+      agent.id === invocation.agentId ||
+      agent.parentAgentId ||
+      agent.workspaceId !== invocation.workspace.id
+    ) {
       return false;
     }
     if (invocation.sourceAgentId && invocation.sourceAgentId !== agent.id) {
@@ -129,6 +141,42 @@ export default function contribute(server: PluginServerContext) {
 
   function hasFinished(invocation: AgentInvocation) {
     return invocation.phase === "finished";
+  }
+
+  async function prepareSource(invocation: AgentInvocation, context: PluginHookContext) {
+    if (needsSourceTask(invocation.configuration)) {
+      await watchSource(invocation, context);
+    } else {
+      await startAgent(invocation, context);
+    }
+  }
+
+  async function archiveFinishedAgent(
+    invocation: AgentInvocation,
+    context: PluginHookContext,
+  ) {
+    if (
+      stopped || context.signal.aborted || invocation.abort.signal.aborted ||
+      invocation.archiveRequested || invocation.archived ||
+      invocations.get(invocation.workspace.id) !== invocation
+    ) {
+      return;
+    }
+    invocation.archiveRequested = true;
+    try {
+      await context.paseo.agents.ref(invocation.agentId).archive();
+      invocation.archived = true;
+      log("agent_archive_completed", {
+        workspaceId: invocation.workspace.id,
+        agentId: invocation.agentId,
+      });
+    } catch (error) {
+      log("agent_archive_failed", {
+        workspaceId: invocation.workspace.id,
+        agentId: invocation.agentId,
+        error: error instanceof Error ? error.message : String(error),
+      }, true);
+    }
   }
 
   async function sourceTaskAvailable(
@@ -252,16 +300,14 @@ export default function contribute(server: PluginServerContext) {
     if (
       stopped ||
       context.signal.aborted ||
+      invocation.abort.signal.aborted ||
       invocation.phase !== "waiting" ||
       invocations.get(workspace.id) !== invocation
     ) {
       return;
     }
-    if (
-      (invocation.configuration.prompt.includes("{{source_agent_id}}") ||
-        invocation.configuration.prompt.includes("{{task_prompt}}")) &&
-      (!invocation.sourceAgentId || !invocation.sourceTaskReady)
-    ) {
+    if (!invocation.sourceAgentId ||
+      (needsSourceTask(invocation.configuration) && !invocation.sourceTaskReady)) {
       return;
     }
     const prompt = renderPrompt(invocation.configuration.prompt, invocation);
@@ -284,6 +330,8 @@ export default function contribute(server: PluginServerContext) {
     try {
       await context.paseo.workspaces.ref(workspace.id).agents.create({
         agentId: invocation.agentId,
+        parent: invocation.sourceAgentId,
+        autoArchive: true,
         config: {
           provider: `${invocation.configuration.provider}/${invocation.configuration.model}`,
           modeId: invocation.configuration.modeId,
@@ -354,14 +402,7 @@ export default function contribute(server: PluginServerContext) {
         phase: "waiting",
       };
       invocations.set(workspace.id, invocation);
-      if (
-        configuration.prompt.includes("{{source_agent_id}}") ||
-        configuration.prompt.includes("{{task_prompt}}")
-      ) {
-        log("waiting_for_source", { workspaceId: workspace.id });
-      } else {
-        await startAgent(invocation, context);
-      }
+      log("waiting_for_source", { workspaceId: workspace.id });
     },
   );
 
@@ -376,7 +417,7 @@ export default function contribute(server: PluginServerContext) {
     const workspaceId = event.agent.workspaceId;
     const invocation = workspaceId ? invocations.get(workspaceId) : null;
     if (invocation && selectSource(invocation, event.agent)) {
-      await watchSource(invocation, context);
+      await prepareSource(invocation, context);
     }
   });
 
@@ -384,7 +425,7 @@ export default function contribute(server: PluginServerContext) {
     const workspaceId = event.agent.workspaceId;
     const invocation = workspaceId ? invocations.get(workspaceId) : null;
     if (invocation && selectSource(invocation, event.agent)) {
-      await watchSource(invocation, context);
+      await prepareSource(invocation, context);
     }
   });
 
@@ -394,6 +435,10 @@ export default function contribute(server: PluginServerContext) {
       const workspaceId = event.agent.workspaceId;
       const pending = workspaceId ? invocations.get(workspaceId) : null;
       if (!pending || !selectSource(pending, event.agent)) {
+        return;
+      }
+      if (!needsSourceTask(pending.configuration)) {
+        await startAgent(pending, context);
         return;
       }
       const task = event.timeline.find(
@@ -420,6 +465,7 @@ export default function contribute(server: PluginServerContext) {
       },
       failed,
     );
+    await archiveFinishedAgent(invocation, context);
   });
 
   const removePermissionRequested = server.on(
@@ -440,6 +486,7 @@ export default function contribute(server: PluginServerContext) {
     const invocation = invocationFor(event.agent);
     if (invocation) {
       invocation.phase = "finished";
+      invocation.archived = true;
       log("agent_archived", {
         workspaceId: event.agent.workspaceId,
         agentId: event.agent.id,
