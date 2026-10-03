@@ -1,6 +1,8 @@
 # paseo-loom
 
-`paseo-loom` 是一个仅在服务端运行的 Paseo 插件。它监听新 workspace 的创建事件，读取本机 Paseo daemon 环境中的配置，并在该 workspace 内调用配置好的 Agent。对应环境变量缺失或为空时，插件跳过处理。
+`paseo-loom` 是一个仅在服务端运行的 Paseo 插件。它监听新 workspace 的创建事件，读取本机 Paseo daemon 环境中的配置，并在该 workspace 内调用配置好的 Agent。处理 Agent 依附于原任务，以子 Agent 运行，结束后自动归档。对应环境变量缺失或为空时，插件跳过处理。
+
+处理 Agent 不自动打开标签页，也不产生 workspace 新回复提示或用户通知；原任务的完成提示正常保留。需要排查时可以主动查看子 Agent 或按 ID 读取历史。子 Agent 运行期间仍可能贡献 workspace 的运行状态；权限等待记录在子 Agent 和插件日志中，插件不自动批准。现有四个环境变量无需修改。
 
 **插件本身不提供实质性的重命名规则。** Agent 使用哪个 provider、哪个模型、哪种权限模式、执行什么规则，都由环境变量指定。是否重命名、如何生成标题、是否调用某个 Skill，以及业务层面的跳过条件，都由配置的 prompt 决定；插件不内置这些行为，也不直接修改标题。
 
@@ -51,16 +53,18 @@ flowchart TD
     ReadConfig --> ConfigPresent{"四个变量均非空且不全为空白？"}
     ConfigPresent -- "否" --> SkipConfig["workspace_skipped<br>reason = configuration_missing<br>仅记录缺失的变量名"]
     ConfigPresent -- "是" --> RegisterContext["按 workspace ID 预登记调用<br>分配待创建 Agent ID"]
-    RegisterContext --> NeedsSource{"prompt 显式包含来源占位符？"}
-    NeedsSource -- "否" --> Render["单次替换配置中使用的占位符<br>不追加业务规则"]
-    NeedsSource -- "是" --> WaitSource["waiting_for_source<br>仅观察同一 workspace 的 Agent 事件"]
-    WaitSource --> SourceReady{"同一 workspace 的来源 ID 已确定<br>且时间线已有真实用户消息？"}
+    RegisterContext --> WaitSource["waiting_for_source<br>仅观察同一 workspace 的根 Agent 事件"]
+    WaitSource --> SourceSelected{"来源根 Agent ID 已确定？"}
+    SourceSelected -- "否" --> WaitSource
+    SourceSelected -- "是" --> NeedsSource{"prompt 包含来源占位符？"}
+    NeedsSource -- "否，不含来源占位符" --> Render["单次替换配置中使用的占位符<br>不追加业务规则"]
+    NeedsSource -- "是" --> SourceReady{"时间线已有真实用户消息？"}
     SourceReady -- "否" --> WaitOrSkip["订阅实时用户消息并回读已存时间线<br>候选来源冲突则停止，不猜测"]
     SourceReady -- "是" --> Render
     Render --> PromptPresent{"替换后的 prompt 非空且不全为空白？"}
     PromptPresent -- "否" --> SkipPrompt["workspace_skipped<br>reason = prompt_empty_after_render"]
     PromptPresent -- "是" --> Reserve["phase = requested<br>agent_request_started"]
-    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>一次请求传入 provider/model、modeId 与 prompt<br>不绑定父 Agent，不再调用 send"]
+    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>传入 provider/model、modeId、prompt<br>parent = 来源 ID，autoArchive = true"]
     Create --> Result{"SDK 创建请求返回成功？"}
     Result -- "否" --> Failed["agent_request_failed<br>已 finished 则保留，否则 phase = unknown<br>保留去重状态，不自动重试"]
     Result -- "是" --> Current{"插件仍有效、调用未取消<br>且调用记录仍匹配？"}
@@ -73,7 +77,7 @@ flowchart TD
     Create -. "事件可能早于 SDK 请求返回" .-> Observe["按预登记的 workspace ID 与 Agent ID<br>进入下面的事件观察流程"]
 ```
 
-不使用来源占位符时，`workspace.created` 仍立即发起调用，不要求已有其他 Agent 或用户任务；显式使用来源占位符时，才等待同一 workspace 的关联 Agent。SDK 请求返回与 Agent 事件没有固定先后顺序；请求失败也不代表规则一定没有执行，因此插件不会自动重试。
+所有 prompt 都等待同一 workspace 的原任务根 Agent。普通 prompt 选中来源后即可发起调用，不读取用户任务；显式使用来源占位符时，还需等待来源的首条非空用户消息。SDK 请求返回与 Agent 事件没有固定先后顺序；请求失败也不代表规则一定没有执行，因此插件不会自动重试。
 
 ### Agent 事件观察、归档与清理
 
@@ -89,6 +93,11 @@ flowchart TD
     FinishTurn --> Outcome{"回合结果为 completed？"}
     Outcome -- "是" --> CompletedLog["记录 agent_turn_completed<br>不验证标题或其他业务结果"]
     Outcome -- "否" --> FailedLog["记录 agent_turn_failed<br>保留 failed 或 canceled 的结果"]
+    CompletedLog --> ArchiveFallback["按处理 Agent ID 幂等归档兜底<br>覆盖快速完成，不归档原任务"]
+    FailedLog --> ArchiveFallback
+    ArchiveFallback --> ArchiveResult{"归档请求成功？"}
+    ArchiveResult -- "是" --> ArchiveCompleted["记录 agent_archive_completed"]
+    ArchiveResult -- "否" --> ArchiveFailed["记录 agent_archive_failed<br>不重新执行规则"]
     EventType -- "agent.permission_requested" --> PermissionOpen{"phase 尚未 finished？"}
     PermissionOpen -- "否" --> IgnorePermission["忽略已经结束调用的权限通知"]
     PermissionOpen -- "是" --> PermissionLog["记录 agent_permission_requested<br>由用户处理，插件不自动批准"]
@@ -157,12 +166,12 @@ flowchart TD
 | `{{workspace_id}}` | 触发事件的稳定 workspace ID |
 | `{{cwd}}` | 该 workspace 的目录 |
 | `{{workspace_title}}` | 创建事件中的 workspace 名称；为空时替换为空字符串 |
-| `{{source_agent_id}}` | 同一 workspace 中最先观察到的非本插件 Agent 的稳定 ID；等其时间线出现用户任务后才传入 |
+| `{{source_agent_id}}` | 同一 workspace 中最先观察到的非本插件根 Agent 的稳定 ID，同时作为父 Agent；等其时间线出现用户任务后才传入 |
 | `{{task_prompt}}` | 该来源 Agent 时间线中的第一条非空用户消息；仅显式使用时才注入任务原文 |
 
 占位符只替换一次，替换值不会被再次展开。其他占位符原样保留。如果替换后的 prompt 为空或仅含空白，插件也会跳过处理，避免创建没有指令的 Agent。
 
-仅当模板包含 `{{source_agent_id}}` 或 `{{task_prompt}}` 时，插件才按稳定 workspace ID 观察非本插件 Agent。确定来源 ID 后，先订阅该 Agent 的实时用户消息，再回读它已存的时间线以填补订阅建立时的间隙；只要出现非空用户消息，就启动处理 Agent，**不等待整个回合结束**。来源回合结束事件的完整快照只用作漏事件时的兜底。只使用 `{{source_agent_id}}` 时，插件不把任务原文写入 prompt；若显式使用 `{{task_prompt}}`，才会将原文注入，可能影响提示词行为。不会按 cwd、项目名或标题匹配，也不扫描全局 Agent 列表；如果在启动前观察到多个来源候选，则停止，不猜测哪一个是原始任务。事件没有历史重放，错过关联事件或没有用户文本时不会伪造上下文。
+所有模板都按稳定 workspace ID 观察非本插件根 Agent，忽略其他子 Agent，以确定处理 Agent 的父 Agent。普通 prompt 在来源出现后直接启动。仅当模板包含 `{{source_agent_id}}` 或 `{{task_prompt}}` 时，才订阅来源的实时用户消息并回读已存时间线，以填补订阅建立时的间隙；只要出现非空用户消息，就启动处理 Agent，**不等待整个回合结束**。来源回合结束事件的完整快照只用作漏事件时的兜底。只使用 `{{source_agent_id}}` 时，插件不把任务原文写入 prompt；若显式使用 `{{task_prompt}}`，才会将原文注入，可能影响提示词行为。不会按 cwd、项目名或标题匹配，也不扫描全局 Agent 列表；如果在启动前观察到多个来源候选，则停止，不猜测哪一个是原始任务。事件没有历史重放，错过关联事件或没有用户文本时不会伪造上下文。
 
 下面仅展示配置文本的结构，不是插件内置规则。请将最后一行替换为你实际希望 Agent 执行的规则，再将完整文本设置为 `PASEO_LOOM_PROMPT`：
 
@@ -188,10 +197,10 @@ flowchart TD
 
 1. 收到 `workspace.created` 后，检查 workspace 是否已归档、调用是否已取消，以及当前进程是否已经处理该 workspace。
 2. 读取四个 `PASEO_LOOM_*` 环境变量，包括必需的权限模式 ID。缺少配置时立即跳过。
-3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。只有 prompt 使用来源占位符时，才观察同一 workspace 的来源 Agent；其首条用户消息可读后立即调用，不等待回合完成。普通 prompt 不等待。
+3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。所有 prompt 都等待同一 workspace 的来源根 Agent；普通 prompt 选中来源后调用，使用来源占位符时等其首条用户消息可读后立即调用，不等待回合完成。
 4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式，权限模式通过 `config.modeId` 显式传入，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
-5. 调用不绑定其他 Agent 为父 Agent。已经创建的处理 Agent 的事件只用于日志观察，不能再次触发规则执行。
-6. 按预先登记的 workspace ID 和 Agent ID 记录创建、完成、失败、取消、权限请求和归档事件。即使 Agent 很快完成、事件早于创建请求返回，也能关联本次调用。
+5. 创建请求同时传入 `parent: sourceAgentId` 和 `autoArchive: true`。Paseo 将其视为同一 workspace 的子 Agent，抑制自动打开标签页和用户通知，不向原任务发送完成消息。
+6. 按预先登记的 workspace ID 和 Agent ID 记录生命周期。完成、失败或取消时按处理 Agent ID 发起幂等归档兜底，覆盖回合结束早于创建请求返回的情况；不归档原任务，也不清除原任务的未读状态。
 
 插件只负责环境配置读取、必要的 workspace 信息替换和 Agent 调用。Agent 的实际动作及结果验证方式由规则决定；Agent 回合完成不代表标题已重命名，也不代表规则的业务结果已经通过验收。
 
@@ -201,7 +210,7 @@ flowchart TD
 
 - `workspace_skipped`：配置缺失、替换后的 prompt 为空或 workspace 已归档，未发起 Agent 调用。
 - `duplicate_workspace_ignored`：忽略当前进程已经登记的 workspace 创建事件。
-- `waiting_for_source` / `source_agent_selected`：模板要求来源上下文，等待或选中同一 workspace 的 Agent；不记录原始任务文本。
+- `waiting_for_source` / `source_agent_selected`：所有模板均等待或选中同一 workspace 的根 Agent，作为父 Agent；不记录原始任务文本。
 - `source_task_available`：实时消息、定向回读或回合结束兜底确认任务已可读；日志只记录获取方式和来源 ID，不记录任务原文。
 - `source_task_unavailable` / `source_observation_failed`：尚无非空用户任务或实时订阅失败；后者保留回合结束兜底。
 - `source_ambiguous` / `source_archived`：多个来源候选或来源在任务可读前归档时停止，不猜测来源。
@@ -213,6 +222,7 @@ flowchart TD
 - `agent_turn_completed` / `agent_turn_failed`：观察到 Agent 回合完成、失败或取消，只记录回合结果，不判定标题或其他业务结果。
 - `agent_permission_requested`：Agent 需要用户处理权限请求；插件不会自动批准。
 - `agent_archived`：该 Agent 已归档。
+- `agent_archive_completed` / `agent_archive_failed`：回合终态后的归档兜底成功或失败；失败不会导致规则重新执行或来源 Agent 被归档。
 
 开始提交请求后，即使出现失败或超时，也保留当前进程内的去重状态，不自动重试。创建失败不一定意味着没有创建出 Agent，prompt 投递失败也不一定意味着未执行规则；自动重试可能产生重复 Agent 或重复执行。
 
@@ -226,6 +236,7 @@ workspace 归档时清除对应状态；插件清理时注销监听器并清空�
 
 ```bash
 npm install
+npm test
 npm run typecheck
 ```
 
@@ -241,14 +252,16 @@ paseo plugin logs paseo-loom
 ## 本地验收
 
 - 分别测试四个环境变量缺失、空字符串和纯空白的情况，尤其是旧配置缺少 `PASEO_LOOM_MODE_ID`。插件应跳过处理，不创建 Agent；日志只指出缺失的配置键。
-- 使用不包含占位符、不调用命名 Skill 的普通 prompt 创建新 workspace。无需已有 Agent 或用户任务，插件也应按环境配置发起调用。
+- 使用不包含占位符、不调用命名 Skill 的普通 prompt 创建新 workspace。尚无来源 Agent 时不调用；来源根 Agent 出现后立即创建处理子 Agent，不要求用户任务文本。
 - 只使用 `{{source_agent_id}}` 创建新 workspace：让来源首个回合长期运行，确认其首条用户消息进入时间线后、回合结束前就启动处理 Agent；prompt 只包含稳定来源 ID，不含任务原文。
 - 分别验证实时消息和订阅后的定向回读都能触发一次调用；订阅失败、来源归档、缺失用户消息或多个候选来源不会从其他 workspace 猜测。若明确使用 `{{task_prompt}}`，确认原文只在此时注入。
-- 检查实际调用的 provider/model、`config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读 `currentModeId`，确认没有插件追加的规则、父 Agent 绑定或第二次 prompt 发送。
+- 检查实际调用的 provider/model、`config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读 `currentModeId` 和 `parentAgentId`，确认父 Agent 是原任务、没有插件追加的规则或第二次 prompt 发送。
 - 在明确选择相应权限模式后，验证规则涉及的 MCP 工具能否按该模式执行；不能用本地参数测试替代实际授权行为验证。插件始终不自动批准现有 Agent 的权限请求。
 - 检查五个可选占位符、替换值中的占位符和替换元字符，以及未识别的占位符。只执行一次已支持的替换，其他内容保持原样；替换后没有有效指令时跳过调用。
 - 验证重复和并发 workspace 创建事件只发起一次调用；普通 Agent 创建或回合结束事件不能触发新调用。
 - 测试快速完成、创建失败、初始 prompt 失败、权限等待、取消和归档；确认事件按准确 Agent ID 关联，且不自动重试或批准权限。
+- 同一 workspace 的其他子 Agent 不能被选为来源，也不能造成来源候选冲突；等待来源任务时出现多个根 Agent 仍停止调用。
+- 在真实客户端确认处理 Agent 不自动打开标签页、不触发新回复提示或用户通知；成功、失败和取消后归档，原任务的正常回复、未读和完成提醒均保留。主动查看子 Agent 不属于自动打开行为。
 - 根据你配置的实际规则验证业务结果。只有当环境中的规则要求重命名时，才检查标题、处理范围及相关 Skill 的执行情况。
 
 类型检查和本地事件模拟不能替代 daemon 级验收。安装插件、修改或重启 daemon，以及运行真实 Agent，都属于单独的操作步骤。
