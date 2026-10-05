@@ -6,9 +6,60 @@
 
 **插件本身不提供实质性的重命名规则。** Agent 使用哪个 provider、哪个模型、哪种权限模式、执行什么规则，都由环境变量指定。是否重命名、如何生成标题、是否调用某个 Skill，以及业务层面的跳过条件，都由配置的 prompt 决定；插件不内置这些行为，也不直接修改标题。
 
+## 线上安装
+
+推荐直接通过 GitHub 安装。目标 Paseo daemon 需满足 `>=0.9.1`，且能够访问该仓库。安装、下载与编译都在目标 daemon 主机上进行，无需手动 clone、运行 `npm install` 或自行编译 TypeScript。
+
+在目标主机的 **Settings → Plugins** 中启用 **Enable plugins**，然后在 **Plugin source** 填入以下来源，选择 **Install plugin**：
+
+```text
+github:qsoyq/paseo-loom
+```
+
+也可以在 daemon 主机上使用 CLI：
+
+```bash
+paseo plugin install github:qsoyq/paseo-loom
+paseo plugin ls --json
+paseo plugin logs paseo-loom
+```
+
+确认插件状态为 `running`。CLI 默认操作本地 daemon；管理其他 daemon 时，为命令指定 `--host <host>`，并确认所操作的主机与界面中选择的一致。
+
+插件运行还需要在目标 daemon 及插件进程继承的环境中配置 `PASEO_LOOM_PROVIDER`、`PASEO_LOOM_MODEL`、`PASEO_LOOM_MODE_ID` 和 `PASEO_LOOM_PROMPT`，详见[配置](#配置)。配置缺失不影响加载，但会跳过 Agent 调用。
+
+如果同一 daemon 已安装 ID 为 `paseo-loom` 的本地目录版本，直接安装 GitHub 版本会因 ID 冲突被拒绝。迁移时，先按下文的重载注意事项确认旧实例没有待处理调用，再移除旧安装记录并安装 GitHub 来源；移除本地目录安装不会删除源码目录。
+
+### 更新
+
+GitHub 安装使用 Paseo 管理的源码副本。先预览更新，再审核并应用：
+
+```bash
+paseo plugin update paseo-loom --check
+paseo plugin update paseo-loom
+```
+
+普通更新检查仓库默认分支的最新 HEAD，并要求确认。`reload` 只重新加载已安装的文件，不下载远端更新。本地目录安装则应修改源码后使用 `reload`，见[本地开发](#本地开发)。更新会替换插件实例，同样需要遵守下文关于等待来源任务时重载的注意事项。
+
+### 稳定版本
+
+稳定版本采用 `vX.Y.Z` 格式的 Git tag。安装或更新时可通过 `--ref` 选择已发布的 tag。以下 `vX.Y.Z` 是占位符，需替换为仓库中实际存在的版本 tag；这些示例不表示该版本已经发布。
+
+```bash
+# 首次安装指定版本
+paseo plugin install github:qsoyq/paseo-loom --ref vX.Y.Z
+
+# 将已安装的 GitHub 版本更新到指定版本
+paseo plugin update paseo-loom --ref vX.Y.Z
+```
+
+`--ref` 只选择本次安装或更新的内容，不会锁定后续更新渠道。之后执行普通 `update` 仍会检查默认分支 HEAD；希望继续使用稳定版本时，每次更新都应显式指定目标 tag。显式 `update --ref` 会直接应用目标版本，不再询问确认。
+
+安装与版本选择规则参见 Paseo 官方的[插件来源](https://paseo.sh/docs/plugins/reference.md#plugin-sources)和[更新命令](https://paseo.sh/docs/plugins/reference.md#cli-reference)。上述说明已按 Paseo 0.9.1 CLI 与官方文档核对；全新 daemon 的实际 Git 安装及运行仍需单独验收。
+
 ## 安装与调用生命周期
 
-以下三张图分别描述插件的安装管理、workspace 创建后的调用，以及 Agent 事件观察与清理。环境变量是否齐全不影响插件本身的加载；插件可以处于 `running` 状态，但在配置缺失时跳过 Agent 调用。
+以下三张图分别描述插件的安装管理、workspace 创建后的调用，以及 Agent 事件观察与清理。第一张图的安装部分描述本地开发流程；线上安装入口见上文。环境变量是否齐全不影响插件本身的加载；插件可以处于 `running` 状态，但在配置缺失时跳过 Agent 调用。
 
 ### 安装、加载与重载
 
@@ -248,6 +299,8 @@ paseo plugin ls --json
 paseo plugin reload paseo-loom
 paseo plugin logs paseo-loom
 ```
+
+本地源码修改后，先运行 `npm run typecheck`，再执行 `paseo plugin reload paseo-loom`。本地目录安装不通过 `update` 拉取远端代码；GitHub 安装的更新方式见[更新](#更新)。重载前需按[日志与失败处理](#日志与失败处理)中的注意事项，确认待处理调用已妥善处理。
 
 ## 本地验收
 
