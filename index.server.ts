@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import type { PaseoAgentTimelineSubscription } from "@getpaseo/client";
 import type {
   PluginHookAgent,
   PluginHookContext,
   PluginHookWorkspace,
   PluginServerContext,
 } from "@getpaseo/plugin/server";
+
+type PaseoAgentTimelineSubscription = ReturnType<
+  ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>["timeline"]["subscribe"]
+>;
 
 const environmentKeys = {
   provider: "PASEO_LOOM_PROVIDER",
