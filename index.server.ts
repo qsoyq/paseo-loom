@@ -24,6 +24,10 @@ type LoomConfiguration = {
   prompt: string;
 };
 
+type SourceObservation = {
+  subscription?: PaseoAgentTimelineSubscription;
+};
+
 type AgentInvocation = {
   agentId: string;
   workspace: PluginHookWorkspace;
@@ -31,7 +35,7 @@ type AgentInvocation = {
   sourceAgentId?: string;
   sourceTask?: string;
   sourceTaskReady?: boolean;
-  sourceSubscription?: PaseoAgentTimelineSubscription;
+  sourceObservation?: SourceObservation;
   archiveRequested?: boolean;
   archived?: boolean;
   abort: AbortController;
@@ -105,8 +109,8 @@ export default function contribute(server: PluginServerContext) {
   }
 
   function stopWatchingSource(invocation: AgentInvocation) {
-    const subscription = invocation.sourceSubscription;
-    invocation.sourceSubscription = undefined;
+    const subscription = invocation.sourceObservation?.subscription;
+    invocation.sourceObservation = undefined;
     if (subscription) {
       void subscription.release().catch(() => {
         log("source_subscription_cleanup_failed", {
@@ -216,12 +220,43 @@ export default function contribute(server: PluginServerContext) {
     const sourceAgentId = invocation.sourceAgentId;
     if (
       !sourceAgentId ||
-      invocation.sourceSubscription ||
+      invocation.sourceObservation ||
       invocation.phase !== "waiting" ||
       invocation.abort.signal.aborted
     ) {
       return;
     }
+
+    // Reserve ownership before subscribing: the SDK may deliver callbacks synchronously.
+    const observation: SourceObservation = {};
+    invocation.sourceObservation = observation;
+    const isCurrent = () =>
+      !stopped &&
+      invocation.phase === "waiting" &&
+      !invocation.abort.signal.aborted &&
+      invocations.get(invocation.workspace.id) === invocation &&
+      invocation.sourceObservation === observation;
+    const logObservationFailure = (error?: unknown) => {
+      log("source_observation_failed", {
+        workspaceId: invocation.workspace.id,
+        sourceAgentId,
+        ...(error === undefined ? {} : {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      }, true);
+    };
+    const readbackFailed = (error: unknown) => {
+      if (isCurrent()) {
+        logObservationFailure(error);
+      }
+    };
+    const observationFailed = (error?: unknown) => {
+      if (!isCurrent()) {
+        return;
+      }
+      stopWatchingSource(invocation);
+      logObservationFailure(error);
+    };
 
     try {
       const agent = context.paseo.agents.ref(sourceAgentId);
@@ -230,10 +265,13 @@ export default function contribute(server: PluginServerContext) {
         signal: invocation.abort.signal,
       };
       const readSourceTimeline = async () => {
-        if (invocation.phase !== "waiting" || invocation.abort.signal.aborted) {
+        if (!isCurrent()) {
           return;
         }
         const timeline = await agent.timeline.refetch({ direction: "tail", limit: 100 });
+        if (!isCurrent()) {
+          return;
+        }
         if (timeline.error) {
           throw new Error(timeline.error);
         }
@@ -247,23 +285,15 @@ export default function contribute(server: PluginServerContext) {
         }
       };
       const subscription = agent.timeline.subscribe((event) => {
+        if (!isCurrent()) {
+          return;
+        }
         if (event.agentId === sourceAgentId && event.event.type === "subscription_restored") {
-          void readSourceTimeline().catch(() => {
-            log("source_observation_failed", {
-              workspaceId: invocation.workspace.id,
-              sourceAgentId,
-            }, true);
-          });
+          void readSourceTimeline().catch(readbackFailed);
           return;
         }
         if (event.agentId === sourceAgentId && event.event.type === "error") {
-          stopWatchingSource(invocation);
-          if (invocation.phase === "waiting" && !invocation.abort.signal.aborted) {
-            log("source_observation_failed", {
-              workspaceId: invocation.workspace.id,
-              sourceAgentId,
-            }, true);
-          }
+          observationFailed();
           return;
         }
         if (
@@ -276,25 +306,23 @@ export default function contribute(server: PluginServerContext) {
           );
         }
       });
-      invocation.sourceSubscription = subscription;
-      if (invocation.phase !== "waiting") {
-        stopWatchingSource(invocation);
-        return;
+      observation.subscription = subscription;
+      // A synchronous callback may already have ended this observation. Release
+      // only its handle, and consume acknowledgement failures even after release.
+      if (!isCurrent()) {
+        void subscription.release().catch(() => {
+          log("source_subscription_cleanup_failed", {
+            workspaceId: invocation.workspace.id,
+          }, true);
+        });
       }
       await subscription.ready;
-      if (invocation.phase !== "waiting") {
+      if (!isCurrent()) {
         return;
       }
-      await readSourceTimeline();
+      await readSourceTimeline().catch(readbackFailed);
     } catch (error) {
-      stopWatchingSource(invocation);
-      if (invocation.phase === "waiting" && !invocation.abort.signal.aborted) {
-        log("source_observation_failed", {
-          workspaceId: invocation.workspace.id,
-          sourceAgentId,
-          error: error instanceof Error ? error.message : String(error),
-        }, true);
-      }
+      observationFailed(error);
     }
   }
 

@@ -11,6 +11,13 @@ const source = {
   provider: "codex", cwd: workspace.cwd, title: "User task",
 };
 const taskItem = (text = "Original user task") => ({ type: "user_message", text });
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 
 function harness(t, options = {}) {
   const previous = { ...process.env };
@@ -31,6 +38,7 @@ function harness(t, options = {}) {
   t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
   const listeners = new Map();
   const timelineListeners = new Map();
+  const subscriptions = [];
   const creations = [];
   const archives = [];
   const refetches = [];
@@ -63,17 +71,22 @@ function harness(t, options = {}) {
           timeline: {
             subscribe(listener) {
               timelineListeners.set(id, listener);
-              return {
+              const subscription = {
+                id, listener,
                 ready: options.subscriptionError
                   ? Promise.reject(options.subscriptionError) : Promise.resolve(),
                 async release() {
                   released.push(id);
-                  timelineListeners.delete(id);
+                  if (timelineListeners.get(id) === listener) timelineListeners.delete(id);
                 },
               };
+              subscriptions.push(subscription);
+              options.onSubscribe?.(subscription);
+              return subscription;
             },
             async refetch(query) {
               refetches.push({ id, query });
+              if (options.onRefetch) return options.onRefetch(query, h);
               return { entries: (options.history ?? []).map((item) => ({ item })) };
             },
           },
@@ -89,7 +102,7 @@ function harness(t, options = {}) {
   });
   t.after(cleanup);
   h = {
-    creations, archives, refetches, logs, released, abort, cleanup,
+    creations, archives, refetches, logs, released, subscriptions, abort, cleanup,
     async emit(name, payload) {
       await listeners.get(name)?.(payload, { paseo, signal: abort.signal });
     },
@@ -105,7 +118,7 @@ function harness(t, options = {}) {
       timelineListeners.get(agentId)?.({
         agentId, event: { type: "timeline", item },
       });
-      await new Promise((resolve) => setImmediate(resolve));
+      await flush();
     },
   };
   return h;
@@ -299,4 +312,132 @@ test("cleanup removes listeners and releases pending observation", async (t) => 
   await h.open();
   assert.equal(h.creations.length, 0);
   assert.deepEqual(h.released, [source.id]);
+});
+
+test("a late failure from a replaced subscription cannot release the new observation", async (t) => {
+  const ready = deferred();
+  const h = harness(t, {
+    prompt: "{{source_agent_id}}",
+    onSubscribe(subscription) {
+      if (subscription.id === source.id && h.subscriptions.length === 1) {
+        subscription.ready = ready.promise;
+      }
+    },
+  });
+  await h.open();
+  const firstHook = h.emit("agent.created", { agent: source });
+  const first = h.subscriptions[0];
+  first.listener({ agentId: source.id, event: { type: "error", error: "Disconnected" } });
+  await h.emit("agent.turn_started", { agent: source });
+  assert.equal(h.subscriptions.length, 2);
+  ready.reject(new Error("Old acknowledgement failed"));
+  await firstHook;
+  await h.message();
+  assert.equal(h.creations.length, 1);
+  assert.equal(h.creations[0].parent, source.id);
+  assert.equal(h.logs.filter((entry) => entry.event === "source_observation_failed").length, 1);
+});
+
+test("readback from a released observation cannot supply a stale task", async (t) => {
+  const readback = deferred();
+  const h = harness(t, {
+    prompt: "{{task_prompt}}",
+    onRefetch(_query, fixture) {
+      return fixture.refetches.length === 1 ? readback.promise : { entries: [] };
+    },
+  });
+  await h.open();
+  const firstHook = h.emit("agent.created", { agent: source });
+  await flush();
+  h.subscriptions[0].listener({ agentId: source.id, event: { type: "error", error: "Disconnected" } });
+  await h.emit("agent.turn_started", { agent: source });
+  readback.resolve({ entries: [{ item: taskItem("Stale task") }] });
+  await firstHook;
+  assert.equal(h.creations.length, 0);
+  await h.message(taskItem("Current task"));
+  assert.equal(h.creations[0].prompt, "Current task");
+});
+
+for (const type of ["error", "subscription_restored", "timeline"]) {
+  test(`a released subscription ignores a late ${type} callback`, async (t) => {
+    const h = harness(t, { prompt: "{{task_prompt}}" });
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    const first = h.subscriptions[0];
+    first.listener({ agentId: source.id, event: { type: "error", error: "Disconnected" } });
+    await h.emit("agent.turn_started", { agent: source });
+    first.listener({ agentId: source.id, event: { type, item: taskItem("Stale task") } });
+    await flush();
+    assert.equal(h.creations.length, 0);
+    assert.equal(h.refetches.length, 2);
+    await h.message(taskItem("Current task"));
+    assert.equal(h.creations[0].prompt, "Current task");
+    assert.equal(h.logs.filter((entry) => entry.event === "source_observation_failed").length, 1);
+  });
+}
+
+for (const type of ["error", "timeline"]) {
+  test(`a synchronous ${type} callback releases its handle and consumes ready rejection`, async (t) => {
+    const h = harness(t, {
+      prompt: "{{task_prompt}}",
+      onSubscribe(subscription) {
+        subscription.ready = Promise.reject(new Error("Acknowledgement failed"));
+        subscription.listener({ agentId: source.id, event: { type, item: taskItem() } });
+      },
+    });
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    await flush();
+    assert.deepEqual(h.released, [source.id]);
+    assert.equal(h.creations.length, type === "timeline" ? 1 : 0);
+    assert.equal(h.logs.filter((entry) => entry.event === "source_observation_failed").length,
+      type === "error" ? 1 : 0);
+  });
+}
+
+for (const via of ["initial", "restored"]) {
+  test(`a failed ${via} readback preserves live observation`, async (t) => {
+    const h = harness(t, {
+      prompt: "{{task_prompt}}",
+      onRefetch() { throw new Error("History unavailable"); },
+    });
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    if (via === "restored") {
+      h.subscriptions[0].listener({ agentId: source.id, event: { type: "subscription_restored" } });
+      await flush();
+    }
+    assert.deepEqual(h.released, []);
+    await h.message();
+    assert.equal(h.creations[0].prompt, "Original user task");
+  });
+}
+
+for (const stop of ["cleanup", "workspace.archived", "agent.archived"]) {
+  test(`${stop} invalidates pending source readback`, async (t) => {
+    const readback = deferred();
+    const h = harness(t, { prompt: "{{task_prompt}}", onRefetch: () => readback.promise });
+    await h.open();
+    const hook = h.emit("agent.created", { agent: source });
+    await flush();
+    if (stop === "cleanup") h.cleanup();
+    else await h.emit(stop, { agent: source, workspace, archivedAt: "2026-10-03T00:00:00Z" });
+    readback.resolve({ entries: [{ item: taskItem() }] });
+    await hook;
+    assert.equal(h.creations.length, 0);
+    assert.deepEqual(h.released, [source.id]);
+  });
+}
+
+test("source pause, cancellation and archive after launch leave the child running", async (t) => {
+  const h = harness(t);
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  await h.emit("agent.permission_requested", { agent: source, request: { kind: "question" } });
+  await h.finish({ kind: "canceled", reason: "Stopped" }, source);
+  await h.emit("agent.archived", { agent: source, archivedAt: "2026-10-03T00:00:00Z" });
+  assert.equal(h.creations.length, 1);
+  assert.deepEqual(h.archives, []);
+  await h.finish();
+  assert.deepEqual(h.archives, [h.child().id]);
 });
