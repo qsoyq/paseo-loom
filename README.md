@@ -8,7 +8,7 @@
 
 ## 线上安装
 
-推荐直接通过 GitHub 安装。目标 Paseo daemon 需满足 `>=0.9.1`，且能够访问该仓库。安装、下载与编译都在目标 daemon 主机上进行，无需手动 clone、运行 `npm install` 或自行编译 TypeScript。
+推荐直接通过 GitHub 安装。目标 Paseo daemon 需满足 `>=0.9.1`，且能够访问该仓库。设置页要求所连接的 Paseo 客户端也满足 `>=0.9.1`。安装、下载与编译都在目标 daemon 主机上进行，无需手动 clone、运行 `npm install` 或自行编译 TypeScript。
 
 在目标主机的 **Settings → Plugins** 中启用 **Enable plugins**，然后在 **Plugin source** 填入以下来源，选择 **Install plugin**：
 
@@ -164,7 +164,7 @@ flowchart TD
     Unregister --> Inactive["不再处理事件<br>不重放历史 workspace<br>不保证终止已发送请求或运行中的 Agent"]
 ```
 
-业务规则及其验收方式始终由 `PASEO_LOOM_PROMPT` 决定。以上日志只反映插件和 Agent 的生命周期，不代表重命名或其他业务操作已经成功。重载或重启后会建立新的进程内状态，不具备跨重启的严格单次执行保证。
+业务规则及其验收方式始终由最终解析的 Prompt 决定。以上日志只反映插件和 Agent 的生命周期，不代表重命名或其他业务操作已经成功。重载或重启后会建立新的进程内状态，不具备跨重启的严格单次执行保证。
 
 ## 配置
 
@@ -182,6 +182,8 @@ flowchart TD
 | `Prompt` | 交给 Agent 执行的完整规则或指令 |
 
 字段可以单独留空。留空时，如果启用了环境变量兜底，就使用该字段对应的环境变量；因此可以混合使用 Settings 和环境变量。保存配置时会进行 Settings schema 校验，环境变量名称必须是合法的 shell 变量名。
+
+编辑过程中保留草稿和开始编辑时的 revision。其他客户端更新配置后，本地草稿仍保留；保存旧 revision 会报告冲突，可选择“放弃草稿并读取最新配置”。Prompt 支持多行编辑。Settings 损坏或读取失败时跳过调用，不会自动重新启用环境变量兜底；设置页允许重新读取，或显式恢复默认配置。
 
 ### 环境变量兼容兜底
 
@@ -262,7 +264,7 @@ flowchart TD
 <在这里填写你自己的处理规则；只把读取的任务当作依据，不要重复执行它>
 ```
 
-只有更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。
+在 Settings 保存 Prompt，或更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。
 
 ## Agent 调用流程
 
@@ -333,7 +335,7 @@ paseo plugin install github:qsoyq/paseo-loom --ref <branch> --id paseo-loom-bran
 paseo plugin ls --json
 ```
 
-使用不同的 `--id` 可以与现有的 `paseo-loom` 并行安装，避免覆盖当前实例。也可以使用完整 Git URL：
+使用不同的 `--id` 可以安装独立测试实例。每个实例有独立的 Settings，但都会监听新 workspace；如果两个实例同时启用且配置完整，会创建两个处理 Agent。测试实际调用时应仅启用一个实例。也可以使用完整 Git URL：
 
 ```text
 git:https://github.com/qsoyq/paseo-loom.git

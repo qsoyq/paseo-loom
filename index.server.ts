@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { defaultEnvironmentKeys, defaultLoomSettings, loomSettings, type LoomSettings } from "./shared/settings.ts";
+import { loomSettings, type LoomSettings } from "./shared/settings.ts";
 import type {
   PluginHookAgent,
   PluginHookContext,
@@ -111,33 +111,24 @@ function needsSourceTask(configuration: LoomConfiguration) {
 
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(loomSettings);
-  const fallbackSettings: LoomSettings = {
-    ...defaultLoomSettings,
-    environmentKeys: { ...defaultEnvironmentKeys },
-  };
   let currentSettings: LoomSettings | null = null;
-  let resolveSettingsReady: (value: LoomSettings) => void = () => {};
-  const settingsReady = new Promise<LoomSettings>((resolve) => {
-    resolveSettingsReady = resolve;
-  });
+  let settingsChanged = false;
   const applySettings = (state: Awaited<ReturnType<typeof settings.read>>) => {
-    if (state.status === "ready") {
-      currentSettings = state.values;
-      resolveSettingsReady(state.values);
-      return;
+    currentSettings = state.status === "ready" ? state.values : null;
+    if (state.status === "invalid") {
+      log("settings_invalid", { reason: "saved_configuration_invalid" }, true);
     }
-    currentSettings = fallbackSettings;
-    resolveSettingsReady(fallbackSettings);
-    log("settings_invalid", { error: state.error }, true);
   };
-  void settings.read().then(applySettings, (error) => {
-    log("settings_read_failed", {
-      error: error instanceof Error ? error.message : String(error),
-    }, true);
-    currentSettings = fallbackSettings;
-    resolveSettingsReady(fallbackSettings);
+  const removeSettingsSubscription = settings.subscribe((state) => {
+    settingsChanged = true;
+    applySettings(state);
   });
-  const removeSettingsSubscription = settings.subscribe(applySettings);
+  const settingsReady = settings.read().then((state) => {
+    if (!settingsChanged) applySettings(state);
+  }, () => {
+    log("settings_read_failed", { reason: "configuration_unavailable" }, true);
+  });
+  const pendingWorkspaces = new Map<string, AbortController>();
 
   const invocations = new Map<string, AgentInvocation>();
   let stopped = false;
@@ -458,17 +449,24 @@ export default function contribute(server: PluginServerContext) {
         });
         return;
       }
-      if (invocations.has(workspace.id)) {
+      if (invocations.has(workspace.id) || pendingWorkspaces.has(workspace.id)) {
         log("duplicate_workspace_ignored", { workspaceId: workspace.id });
         return;
       }
-      const configuration = readConfiguration(
-        workspace.id,
-        currentSettings ?? await settingsReady,
-      );
-      if (!configuration) {
+      const pending = new AbortController();
+      pendingWorkspaces.set(workspace.id, pending);
+      await settingsReady;
+      pendingWorkspaces.delete(workspace.id);
+      if (stopped || context.signal.aborted || pending.signal.aborted) return;
+      if (!currentSettings) {
+        log("workspace_skipped", {
+          workspaceId: workspace.id,
+          reason: "settings_unavailable",
+        });
         return;
       }
+      const configuration = readConfiguration(workspace.id, currentSettings);
+      if (!configuration) return;
 
       const invocation: AgentInvocation = {
         agentId: randomUUID(),
@@ -580,6 +578,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   const removeWorkspaceArchived = server.on("workspace.archived", (event) => {
+    pendingWorkspaces.get(event.workspace.id)?.abort();
     const invocation = invocations.get(event.workspace.id);
     if (invocation) {
       invocation.abort.abort();
@@ -601,6 +600,8 @@ export default function contribute(server: PluginServerContext) {
     removeAgentArchived();
     removeWorkspaceArchived();
     removeSettingsSubscription();
+    for (const pending of pendingWorkspaces.values()) pending.abort();
+    pendingWorkspaces.clear();
     for (const invocation of invocations.values()) {
       invocation.abort.abort();
       stopWatchingSource(invocation);

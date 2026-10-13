@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import contribute from "../index.server.ts";
+import { loomSettings, defaultLoomSettings } from "../shared/settings.ts";
 
 const workspace = {
   id: "workspace-1", projectId: "project-1", cwd: "/fixture",
@@ -113,6 +114,7 @@ function harness(t, options = {}) {
     registerSettings() {
       return {
         async read() {
+          if (options.readSettings) return options.readSettings();
           return { status: "ready", revision: settingsRevision, values: settingsValues };
         },
         subscribe(listener) {
@@ -210,7 +212,6 @@ test("disabling environment fallback requires complete Settings values", async (
 
 test("live Settings changes affect subsequent workspaces without reload", async (t) => {
   const h = harness(t);
-  await flush();
   await h.updateSettings({
     provider: "live-provider",
     model: "live-model",
@@ -224,10 +225,56 @@ test("live Settings changes affect subsequent workspaces without reload", async 
       prompt: "PASEO_LOOM_PROMPT",
     },
   });
-  await flush();
   await h.open();
   await h.emit("agent.created", { agent: source });
   assert.equal(h.creations[0].config.provider, "live-provider/live-model");
+});
+
+test("pending workspace keeps its configuration after a Settings change", async (t) => {
+  const h = harness(t);
+  await h.open();
+  await h.updateSettings({ ...defaultLoomSettings, prompt: "New rule" });
+  await h.emit("agent.created", { agent: source });
+  assert.equal(h.creations[0].prompt, "Rename workspace-1");
+});
+
+test("invalid saved settings skip work instead of enabling legacy fallback", async (t) => {
+  const h = harness(t, { readSettings: async () => ({ status: "invalid", error: "invalid" }) });
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.equal(h.creations.length, 0);
+  assert.equal(h.logs.at(-1).reason, "settings_unavailable");
+});
+
+test("failed Settings read skips work instead of enabling legacy fallback", async (t) => {
+  const h = harness(t, { readSettings: async () => { throw new Error("unavailable"); } });
+  await h.open();
+  assert.equal(h.logs.at(-1).reason, "settings_unavailable");
+});
+
+for (const stop of ["cleanup", "workspace.archived", "duplicate"]) {
+  test(`${stop} while Settings load does not create duplicate or archived work`, async (t) => {
+    const read = deferred();
+    const h = harness(t, { readSettings: () => read.promise });
+    const opened = h.open();
+    await flush();
+    if (stop === "cleanup") h.cleanup();
+    if (stop === "workspace.archived") await h.emit(stop, { workspace });
+    if (stop === "duplicate") await h.open();
+    read.resolve({ status: "ready", values: defaultLoomSettings, revision: "1" });
+    await opened;
+    await h.emit("agent.created", { agent: source });
+    assert.equal(h.creations.length, stop === "duplicate" ? 1 : 0);
+  });
+}
+
+test("Settings defaults preserve legacy names and reject invalid variable names", () => {
+  assert.deepEqual(loomSettings.schema.parse({}), defaultLoomSettings);
+  for (const name of ["", "1KEY", "KEY-NAME", "KEY NAME", "NAME\n"]) {
+    assert.equal(loomSettings.schema.safeParse({
+      ...defaultLoomSettings, environmentKeys: { ...defaultLoomSettings.environmentKeys, prompt: name },
+    }).success, false);
+  }
 });
 
 test("plain prompt waits for the root and creates one child without changing configuration", async (t) => {
