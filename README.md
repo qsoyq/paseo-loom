@@ -116,7 +116,7 @@ flowchart TD
     Render --> PromptPresent{"替换后的 prompt 非空且不全为空白？"}
     PromptPresent -- "否" --> SkipPrompt["workspace_skipped<br>reason = prompt_empty_after_render"]
     PromptPresent -- "是" --> Reserve["phase = requested<br>agent_request_started"]
-    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>传入 provider/model、modeId、prompt<br>parent = 来源 ID，autoArchive = true"]
+    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>传入 provider/model、可选 modeId、prompt<br>parent = 来源 ID，autoArchive = true"]
     Create --> Result{"SDK 创建请求返回成功？"}
     Result -- "否" --> Failed["agent_request_failed<br>已 finished 则保留，否则 phase = unknown<br>保留去重状态，不自动重试"]
     Result -- "是" --> Current{"插件仍有效、调用未取消<br>且调用记录仍匹配？"}
@@ -178,7 +178,7 @@ flowchart TD
 | --- | --- |
 | `Provider` | 执行规则的 Agent provider |
 | `Model` | 使用的模型 |
-| `Mode ID` | provider 的权限／会话模式 ID，作为 SDK 的 `config.modeId` 显式传入 |
+| `Mode ID` | 可选的 provider 权限／会话模式 ID；填写时作为 SDK 的 `config.modeId` 显式传入，留空时使用 provider 默认模式 |
 | `Prompt` | 交给 Agent 执行的完整规则或指令 |
 
 字段可以单独留空。留空时，如果启用了环境变量兜底，就使用该字段对应的环境变量；因此可以混合使用 Settings 和环境变量。保存配置时会进行 Settings schema 校验，环境变量名称必须是合法的 shell 变量名。
@@ -193,7 +193,7 @@ flowchart TD
 | --- | --- | --- |
 | `Provider` | `PASEO_LOOM_PROVIDER` | 执行规则的 Agent provider |
 | `Model` | `PASEO_LOOM_MODEL` | 使用的模型 |
-| `Mode ID` | `PASEO_LOOM_MODE_ID` | provider 的权限／会话模式 ID |
+| `Mode ID` | `PASEO_LOOM_MODE_ID` | 可选的 provider 权限／会话模式 ID |
 | `Prompt` | `PASEO_LOOM_PROMPT` | 交给 Agent 执行的完整规则或指令 |
 
 设置页支持修改每个环境变量名称。关闭兜底后，环境变量完全不参与配置解析，Settings 中四个字段必须全部有效；开启兜底时，Settings 非空值始终优先。
@@ -204,7 +204,7 @@ flowchart TD
 
 ### 权限模式有效值
 
-权限模式必须显式配置，不能只设置 provider/model 或在 prompt 中要求“不要询问”。旧版本未传入 `modeId`，创建的 Agent 可能使用默认权限并停在 MCP 工具授权请求上。升级后缺少 `PASEO_LOOM_MODE_ID` 时直接跳过，不再静默创建默认权限的 Agent。
+Mode ID 是可选的。填写时插件通过 `config.modeId` 显式传入，适用于支持可选权限模式的 provider；留空时不传该字段，由 provider 使用自己的默认模式。Pi 等没有可选 mode 的 provider 必须留空。只设置 provider/model 或在 prompt 中要求“不要询问”并不等于获得高权限；需要无人值守权限时，应使用目标 provider 支持的明确 mode ID。
 
 请使用所选 provider 支持的模式 **ID**，而不是界面显示名称。ID 区分大小写。以下是 Paseo 原生 Codex 和 Claude Code 的模式；自定义 provider、客户端版本或运行环境可能影响实际可用值，应以目标 provider 的能力查询返回的 `modes[].id` 为准。
 
@@ -271,7 +271,7 @@ flowchart TD
 1. 收到 `workspace.created` 后，检查 workspace 是否已归档、调用是否已取消，以及当前进程是否已经处理该 workspace。
 2. 读取当前 Settings 快照；Settings 中为空的字段在兜底开启时读取对应环境变量，包括必需的权限模式 ID。缺少配置时立即跳过。
 3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。所有 prompt 都等待同一 workspace 的来源根 Agent；普通 prompt 选中来源后调用，使用来源占位符时等其首条用户消息可读后立即调用，不等待回合完成。
-4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式，权限模式通过 `config.modeId` 显式传入，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
+4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式；仅在 Mode ID 非空时传入 `config.modeId`，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
 5. 创建请求同时传入 `parent: sourceAgentId` 和 `autoArchive: true`。Paseo 将其视为同一 workspace 的子 Agent，抑制自动打开标签页和用户通知，不向原任务发送完成消息。
 6. 按预先登记的 workspace ID 和 Agent ID 记录生命周期。完成、失败或取消时按处理 Agent ID 发起幂等归档兜底，覆盖回合结束早于创建请求返回的情况；不归档原任务，也不清除原任务的未读状态。
 
@@ -351,11 +351,11 @@ paseo plugin install git:https://github.com/qsoyq/paseo-loom.git --ref <branch> 
 
 ## 本地验收
 
-- 分别测试四个环境变量缺失、空字符串和纯空白的情况，尤其是旧配置缺少 `PASEO_LOOM_MODE_ID`。插件应跳过处理，不创建 Agent；日志只指出缺失的配置键。
+- 分别测试 provider/model/prompt 缺失、空字符串和纯空白的情况；Mode ID 可以为空，Pi 等无 selectable mode 的 provider 应创建成功，日志只指出真正缺失的配置键。
 - 使用不包含占位符、不调用命名 Skill 的普通 prompt 创建新 workspace。尚无来源 Agent 时不调用；来源根 Agent 出现后立即创建处理子 Agent，不要求用户任务文本。
 - 只使用 `{{source_agent_id}}` 创建新 workspace：让来源首个回合长期运行，确认其首条用户消息进入时间线后、回合结束前就启动处理 Agent；prompt 只包含稳定来源 ID，不含任务原文。
 - 分别验证实时消息和订阅后的定向回读都能触发一次调用；订阅失败、来源归档、缺失用户消息或多个候选来源不会从其他 workspace 猜测。若明确使用 `{{task_prompt}}`，确认原文只在此时注入。
-- 检查实际调用的 provider/model、`config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读 `currentModeId` 和 `parentAgentId`，确认父 Agent 是原任务、没有插件追加的规则或第二次 prompt 发送。
+- 检查实际调用的 provider/model、可选的 `config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读实际 mode 与 `parentAgentId`，确认父 Agent 是原任务、没有插件追加的规则或第二次 prompt 发送。
 - 在明确选择相应权限模式后，验证规则涉及的 MCP 工具能否按该模式执行；不能用本地参数测试替代实际授权行为验证。插件始终不自动批准现有 Agent 的权限请求。
 - 检查五个可选占位符、替换值中的占位符和替换元字符，以及未识别的占位符。只执行一次已支持的替换，其他内容保持原样；替换后没有有效指令时跳过调用。
 - 验证重复和并发 workspace 创建事件只发起一次调用；普通 Agent 创建或回合结束事件不能触发新调用。

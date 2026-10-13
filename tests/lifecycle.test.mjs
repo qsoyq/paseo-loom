@@ -163,6 +163,51 @@ function harness(t, options = {}) {
   return h;
 }
 
+test("an empty mode ID omits mode for providers with no selectable modes", async (t) => {
+  const h = harness(t, {
+    settings: {
+      provider: "pi",
+      model: "magpie/group/auto",
+      modeId: "",
+      prompt: "Rename {{workspace_id}}",
+      useEnvironmentFallback: false,
+      environmentKeys: {
+        provider: "PASEO_LOOM_PROVIDER",
+        model: "PASEO_LOOM_MODEL",
+        modeId: "PASEO_LOOM_MODE_ID",
+        prompt: "PASEO_LOOM_PROMPT",
+      },
+    },
+  });
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.deepEqual(h.creations[0].config, { provider: "pi/magpie/group/auto" });
+});
+
+test("an explicit mode ID remains in the child configuration", async (t) => {
+  const h = harness(t, {
+    settings: {
+      provider: "codex",
+      model: "configured-model",
+      modeId: "full-access",
+      prompt: "Rename {{workspace_id}}",
+      useEnvironmentFallback: false,
+      environmentKeys: {
+        provider: "PASEO_LOOM_PROVIDER",
+        model: "PASEO_LOOM_MODEL",
+        modeId: "PASEO_LOOM_MODE_ID",
+        prompt: "PASEO_LOOM_PROMPT",
+      },
+    },
+  });
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.deepEqual(h.creations[0].config, {
+    provider: "codex/configured-model",
+    modeId: "full-access",
+  });
+});
+
 test("settings values take precedence over environment fallback", async (t) => {
   const h = harness(t, {
     settings: {

@@ -14,7 +14,7 @@ type PaseoAgentTimelineSubscription = ReturnType<
 type LoomConfiguration = {
   provider: string;
   model: string;
-  modeId: string;
+  modeId?: string;
   prompt: string;
 };
 
@@ -68,14 +68,13 @@ function readConfiguration(
     : { provider: "", model: "", modeId: "", prompt: "" };
   const provider = settings.provider.trim() || environment.provider;
   const model = settings.model.trim() || environment.model;
-  const modeId = settings.modeId.trim() || environment.modeId;
+  const modeId = settings.modeId.trim() || environment.modeId || undefined;
   const prompt = settings.prompt.trim() ? settings.prompt : environment.prompt;
 
-  if (!provider || !model || !modeId || !prompt.trim()) {
+  if (!provider || !model || !prompt.trim()) {
     const missingKeys = [
       !provider && "provider",
       !model && "model",
-      !modeId && "modeId",
       !prompt.trim() && "prompt",
     ].filter((key): key is string => Boolean(key));
     log("workspace_skipped", {
@@ -398,7 +397,9 @@ export default function contribute(server: PluginServerContext) {
         autoArchive: true,
         config: {
           provider: `${invocation.configuration.provider}/${invocation.configuration.model}`,
-          modeId: invocation.configuration.modeId,
+          ...(invocation.configuration.modeId
+            ? { modeId: invocation.configuration.modeId }
+            : {}),
         },
         prompt,
         labels: { "paseo-loom.role": "workspace-handler" },
