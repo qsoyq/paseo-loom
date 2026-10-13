@@ -9,6 +9,7 @@ import {
   SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
 import { loomSettings, type LoomSettings } from "../shared/settings.ts";
+import { pluginVersion } from "../shared/version.ts";
 
 type ReadySettings = Extract<SettingsState<typeof loomSettings.schema>, { status: "ready" }>;
 
@@ -90,6 +91,11 @@ function SettingsEditor({ theme, layout, settings }: PluginSurfaceProps & { sett
 
   return (
     <>
+      <SettingsSection title="关于">
+        <SettingsCard>
+          <SettingsRow label="paseo-loom" hint={`版本 ${pluginVersion}`} />
+        </SettingsCard>
+      </SettingsSection>
       <SettingsSection title="Agent 配置">
         <SettingsCard>
           {fields.map(([key, label]) => (
