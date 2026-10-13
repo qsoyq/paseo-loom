@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { defaultEnvironmentKeys, defaultLoomSettings, loomSettings, type LoomSettings } from "./shared/settings.ts";
 import type {
   PluginHookAgent,
   PluginHookContext,
@@ -9,13 +10,6 @@ import type {
 type PaseoAgentTimelineSubscription = ReturnType<
   ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>["timeline"]["subscribe"]
 >;
-
-const environmentKeys = {
-  provider: "PASEO_LOOM_PROVIDER",
-  model: "PASEO_LOOM_MODEL",
-  modeId: "PASEO_LOOM_MODE_ID",
-  prompt: "PASEO_LOOM_PROMPT",
-} as const;
 
 type LoomConfiguration = {
   provider: string;
@@ -56,20 +50,39 @@ function log(event: string, details: Record<string, unknown>, failed = false) {
   }
 }
 
-function readConfiguration(workspaceId: string) {
-  const provider = process.env[environmentKeys.provider]?.trim();
-  const model = process.env[environmentKeys.model]?.trim();
-  const modeId = process.env[environmentKeys.modeId]?.trim();
-  const prompt = process.env[environmentKeys.prompt];
+function readEnvironmentConfiguration(keys: LoomSettings["environmentKeys"]) {
+  return {
+    provider: process.env[keys.provider]?.trim() ?? "",
+    model: process.env[keys.model]?.trim() ?? "",
+    modeId: process.env[keys.modeId]?.trim() ?? "",
+    prompt: process.env[keys.prompt] ?? "",
+  };
+}
 
-  if (!provider || !model || !modeId || !prompt?.trim()) {
-    const missingKeys = Object.values(environmentKeys).filter(
-      (key) => !process.env[key]?.trim(),
-    );
+function readConfiguration(
+  workspaceId: string,
+  settings: LoomSettings,
+): LoomConfiguration | null {
+  const environment = settings.useEnvironmentFallback
+    ? readEnvironmentConfiguration(settings.environmentKeys)
+    : { provider: "", model: "", modeId: "", prompt: "" };
+  const provider = settings.provider.trim() || environment.provider;
+  const model = settings.model.trim() || environment.model;
+  const modeId = settings.modeId.trim() || environment.modeId;
+  const prompt = settings.prompt.trim() ? settings.prompt : environment.prompt;
+
+  if (!provider || !model || !modeId || !prompt.trim()) {
+    const missingKeys = [
+      !provider && "provider",
+      !model && "model",
+      !modeId && "modeId",
+      !prompt.trim() && "prompt",
+    ].filter((key): key is string => Boolean(key));
     log("workspace_skipped", {
       workspaceId,
       reason: "configuration_missing",
       missingKeys,
+      source: settings.useEnvironmentFallback ? "settings_and_environment" : "settings",
     });
     return null;
   }
@@ -97,6 +110,35 @@ function needsSourceTask(configuration: LoomConfiguration) {
 }
 
 export default function contribute(server: PluginServerContext) {
+  const settings = server.registerSettings(loomSettings);
+  const fallbackSettings: LoomSettings = {
+    ...defaultLoomSettings,
+    environmentKeys: { ...defaultEnvironmentKeys },
+  };
+  let currentSettings: LoomSettings | null = null;
+  let resolveSettingsReady: (value: LoomSettings) => void = () => {};
+  const settingsReady = new Promise<LoomSettings>((resolve) => {
+    resolveSettingsReady = resolve;
+  });
+  const applySettings = (state: Awaited<ReturnType<typeof settings.read>>) => {
+    if (state.status === "ready") {
+      currentSettings = state.values;
+      resolveSettingsReady(state.values);
+      return;
+    }
+    currentSettings = fallbackSettings;
+    resolveSettingsReady(fallbackSettings);
+    log("settings_invalid", { error: state.error }, true);
+  };
+  void settings.read().then(applySettings, (error) => {
+    log("settings_read_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }, true);
+    currentSettings = fallbackSettings;
+    resolveSettingsReady(fallbackSettings);
+  });
+  const removeSettingsSubscription = settings.subscribe(applySettings);
+
   const invocations = new Map<string, AgentInvocation>();
   let stopped = false;
 
@@ -420,7 +462,10 @@ export default function contribute(server: PluginServerContext) {
         log("duplicate_workspace_ignored", { workspaceId: workspace.id });
         return;
       }
-      const configuration = readConfiguration(workspace.id);
+      const configuration = readConfiguration(
+        workspace.id,
+        currentSettings ?? await settingsReady,
+      );
       if (!configuration) {
         return;
       }
@@ -555,6 +600,7 @@ export default function contribute(server: PluginServerContext) {
     removePermissionRequested();
     removeAgentArchived();
     removeWorkspaceArchived();
+    removeSettingsSubscription();
     for (const invocation of invocations.values()) {
       invocation.abort.abort();
       stopWatchingSource(invocation);

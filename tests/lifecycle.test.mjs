@@ -44,6 +44,21 @@ function harness(t, options = {}) {
   const refetches = [];
   const released = [];
   const abort = new AbortController();
+  let settingsListener;
+  let settingsValues = options.settings ?? {
+    provider: "",
+    model: "",
+    modeId: "",
+    prompt: "",
+    useEnvironmentFallback: true,
+    environmentKeys: {
+      provider: "PASEO_LOOM_PROVIDER",
+      model: "PASEO_LOOM_MODEL",
+      modeId: "PASEO_LOOM_MODE_ID",
+      prompt: "PASEO_LOOM_PROMPT",
+    },
+  };
+  let settingsRevision = "settings-1";
   let h;
   const paseo = {
     workspaces: {
@@ -95,6 +110,19 @@ function harness(t, options = {}) {
     },
   };
   const cleanup = contribute({
+    registerSettings() {
+      return {
+        async read() {
+          return { status: "ready", revision: settingsRevision, values: settingsValues };
+        },
+        subscribe(listener) {
+          settingsListener = listener;
+          return () => {
+            if (settingsListener === listener) settingsListener = undefined;
+          };
+        },
+      };
+    },
     on(name, listener) {
       listeners.set(name, listener);
       return () => listeners.delete(name);
@@ -103,6 +131,15 @@ function harness(t, options = {}) {
   t.after(cleanup);
   h = {
     creations, archives, refetches, logs, released, subscriptions, abort, cleanup,
+    async updateSettings(values) {
+      settingsValues = values;
+      settingsRevision = `settings-${Date.now()}`;
+      await settingsListener?.({
+        status: "ready",
+        revision: settingsRevision,
+        values,
+      });
+    },
     async emit(name, payload) {
       await listeners.get(name)?.(payload, { paseo, signal: abort.signal });
     },
@@ -123,6 +160,75 @@ function harness(t, options = {}) {
   };
   return h;
 }
+
+test("settings values take precedence over environment fallback", async (t) => {
+  const h = harness(t, {
+    settings: {
+      provider: "settings-provider",
+      model: "",
+      modeId: "settings-mode",
+      prompt: "Settings {{workspace_id}}",
+      useEnvironmentFallback: true,
+      environmentKeys: {
+        provider: "CUSTOM_PROVIDER",
+        model: "CUSTOM_MODEL",
+        modeId: "CUSTOM_MODE",
+        prompt: "CUSTOM_PROMPT",
+      },
+    },
+  });
+  process.env.CUSTOM_MODEL = "custom-model";
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.deepEqual(h.creations[0].config, {
+    provider: "settings-provider/custom-model",
+    modeId: "settings-mode",
+  });
+  assert.equal(h.creations[0].prompt, "Settings workspace-1");
+});
+
+test("disabling environment fallback requires complete Settings values", async (t) => {
+  const h = harness(t, {
+    settings: {
+      provider: "settings-provider",
+      model: "",
+      modeId: "settings-mode",
+      prompt: "Settings prompt",
+      useEnvironmentFallback: false,
+      environmentKeys: {
+        provider: "PASEO_LOOM_PROVIDER",
+        model: "PASEO_LOOM_MODEL",
+        modeId: "PASEO_LOOM_MODE_ID",
+        prompt: "PASEO_LOOM_PROMPT",
+      },
+    },
+  });
+  await h.open();
+  assert.equal(h.creations.length, 0);
+  assert.equal(h.logs.at(-1).reason, "configuration_missing");
+});
+
+test("live Settings changes affect subsequent workspaces without reload", async (t) => {
+  const h = harness(t);
+  await flush();
+  await h.updateSettings({
+    provider: "live-provider",
+    model: "live-model",
+    modeId: "live-mode",
+    prompt: "Live prompt",
+    useEnvironmentFallback: false,
+    environmentKeys: {
+      provider: "PASEO_LOOM_PROVIDER",
+      model: "PASEO_LOOM_MODEL",
+      modeId: "PASEO_LOOM_MODE_ID",
+      prompt: "PASEO_LOOM_PROMPT",
+    },
+  });
+  await flush();
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.equal(h.creations[0].config.provider, "live-provider/live-model");
+});
 
 test("plain prompt waits for the root and creates one child without changing configuration", async (t) => {
   const h = harness(t, { prompt: "  Rename {{workspace_id}} / {{cwd}}  " });
