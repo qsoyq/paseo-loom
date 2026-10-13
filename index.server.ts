@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { loomSettings, type LoomSettings } from "./shared/settings.ts";
 import type {
   PluginHookAgent,
   PluginHookContext,
@@ -10,17 +11,10 @@ type PaseoAgentTimelineSubscription = ReturnType<
   ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>["timeline"]["subscribe"]
 >;
 
-const environmentKeys = {
-  provider: "PASEO_LOOM_PROVIDER",
-  model: "PASEO_LOOM_MODEL",
-  modeId: "PASEO_LOOM_MODE_ID",
-  prompt: "PASEO_LOOM_PROMPT",
-} as const;
-
 type LoomConfiguration = {
   provider: string;
   model: string;
-  modeId: string;
+  modeId?: string;
   prompt: string;
 };
 
@@ -56,20 +50,38 @@ function log(event: string, details: Record<string, unknown>, failed = false) {
   }
 }
 
-function readConfiguration(workspaceId: string) {
-  const provider = process.env[environmentKeys.provider]?.trim();
-  const model = process.env[environmentKeys.model]?.trim();
-  const modeId = process.env[environmentKeys.modeId]?.trim();
-  const prompt = process.env[environmentKeys.prompt];
+function readEnvironmentConfiguration(keys: LoomSettings["environmentKeys"]) {
+  return {
+    provider: process.env[keys.provider]?.trim() ?? "",
+    model: process.env[keys.model]?.trim() ?? "",
+    modeId: process.env[keys.modeId]?.trim() ?? "",
+    prompt: process.env[keys.prompt] ?? "",
+  };
+}
 
-  if (!provider || !model || !modeId || !prompt?.trim()) {
-    const missingKeys = Object.values(environmentKeys).filter(
-      (key) => !process.env[key]?.trim(),
-    );
+function readConfiguration(
+  workspaceId: string,
+  settings: LoomSettings,
+): LoomConfiguration | null {
+  const environment = settings.useEnvironmentFallback
+    ? readEnvironmentConfiguration(settings.environmentKeys)
+    : { provider: "", model: "", modeId: "", prompt: "" };
+  const provider = settings.provider.trim() || environment.provider;
+  const model = settings.model.trim() || environment.model;
+  const modeId = settings.modeId.trim() || environment.modeId || undefined;
+  const prompt = settings.prompt.trim() ? settings.prompt : environment.prompt;
+
+  if (!provider || !model || !prompt.trim()) {
+    const missingKeys = [
+      !provider && "provider",
+      !model && "model",
+      !prompt.trim() && "prompt",
+    ].filter((key): key is string => Boolean(key));
     log("workspace_skipped", {
       workspaceId,
       reason: "configuration_missing",
       missingKeys,
+      source: settings.useEnvironmentFallback ? "settings_and_environment" : "settings",
     });
     return null;
   }
@@ -97,6 +109,26 @@ function needsSourceTask(configuration: LoomConfiguration) {
 }
 
 export default function contribute(server: PluginServerContext) {
+  const settings = server.registerSettings(loomSettings);
+  let currentSettings: LoomSettings | null = null;
+  let settingsChanged = false;
+  const applySettings = (state: Awaited<ReturnType<typeof settings.read>>) => {
+    currentSettings = state.status === "ready" ? state.values : null;
+    if (state.status === "invalid") {
+      log("settings_invalid", { reason: "saved_configuration_invalid" }, true);
+    }
+  };
+  const removeSettingsSubscription = settings.subscribe((state) => {
+    settingsChanged = true;
+    applySettings(state);
+  });
+  const settingsReady = settings.read().then((state) => {
+    if (!settingsChanged) applySettings(state);
+  }, () => {
+    log("settings_read_failed", { reason: "configuration_unavailable" }, true);
+  });
+  const pendingWorkspaces = new Map<string, AbortController>();
+
   const invocations = new Map<string, AgentInvocation>();
   let stopped = false;
 
@@ -365,7 +397,9 @@ export default function contribute(server: PluginServerContext) {
         autoArchive: true,
         config: {
           provider: `${invocation.configuration.provider}/${invocation.configuration.model}`,
-          modeId: invocation.configuration.modeId,
+          ...(invocation.configuration.modeId
+            ? { modeId: invocation.configuration.modeId }
+            : {}),
         },
         prompt,
         labels: { "paseo-loom.role": "workspace-handler" },
@@ -416,14 +450,24 @@ export default function contribute(server: PluginServerContext) {
         });
         return;
       }
-      if (invocations.has(workspace.id)) {
+      if (invocations.has(workspace.id) || pendingWorkspaces.has(workspace.id)) {
         log("duplicate_workspace_ignored", { workspaceId: workspace.id });
         return;
       }
-      const configuration = readConfiguration(workspace.id);
-      if (!configuration) {
+      const pending = new AbortController();
+      pendingWorkspaces.set(workspace.id, pending);
+      await settingsReady;
+      pendingWorkspaces.delete(workspace.id);
+      if (stopped || context.signal.aborted || pending.signal.aborted) return;
+      if (!currentSettings) {
+        log("workspace_skipped", {
+          workspaceId: workspace.id,
+          reason: "settings_unavailable",
+        });
         return;
       }
+      const configuration = readConfiguration(workspace.id, currentSettings);
+      if (!configuration) return;
 
       const invocation: AgentInvocation = {
         agentId: randomUUID(),
@@ -535,6 +579,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   const removeWorkspaceArchived = server.on("workspace.archived", (event) => {
+    pendingWorkspaces.get(event.workspace.id)?.abort();
     const invocation = invocations.get(event.workspace.id);
     if (invocation) {
       invocation.abort.abort();
@@ -555,6 +600,9 @@ export default function contribute(server: PluginServerContext) {
     removePermissionRequested();
     removeAgentArchived();
     removeWorkspaceArchived();
+    removeSettingsSubscription();
+    for (const pending of pendingWorkspaces.values()) pending.abort();
+    pendingWorkspaces.clear();
     for (const invocation of invocations.values()) {
       invocation.abort.abort();
       stopWatchingSource(invocation);

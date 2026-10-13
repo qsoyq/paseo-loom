@@ -1,14 +1,14 @@
 # paseo-loom
 
-`paseo-loom` 是一个仅在服务端运行的 Paseo 插件。它监听新 workspace 的创建事件，读取本机 Paseo daemon 环境中的配置，并在该 workspace 内调用配置好的 Agent。处理 Agent 依附于原任务，以子 Agent 运行，结束后自动归档。对应环境变量缺失或为空时，插件跳过处理。
+`paseo-loom` 是一个监听新 workspace 的 Paseo 插件。它在目标 workspace 内调用配置好的 Agent；处理 Agent 依附于原任务，以子 Agent 运行，结束后自动归档。配置缺失或为空时，插件跳过处理。
 
-处理 Agent 不自动打开标签页，也不产生 workspace 新回复提示或用户通知；原任务的完成提示正常保留。需要排查时可以主动查看子 Agent 或按 ID 读取历史。子 Agent 运行期间仍可能贡献 workspace 的运行状态；权限等待记录在子 Agent 和插件日志中，插件不自动批准。现有四个环境变量无需修改。
+处理 Agent 不自动打开标签页，也不产生 workspace 新回复提示或用户通知；原任务的完成提示正常保留。需要排查时可以主动查看子 Agent 或按 ID 读取历史。子 Agent 运行期间仍可能贡献 workspace 的运行状态；权限等待记录在子 Agent 和插件日志中，插件不自动批准。
 
-**插件本身不提供实质性的重命名规则。** Agent 使用哪个 provider、哪个模型、哪种权限模式、执行什么规则，都由环境变量指定。是否重命名、如何生成标题、是否调用某个 Skill，以及业务层面的跳过条件，都由配置的 prompt 决定；插件不内置这些行为，也不直接修改标题。
+配置既可以在 **Settings → Plugins → paseo-loom** 中填写，也可以继续使用原有四个环境变量。Settings 中的非空字段优先；字段为空且启用了环境变量兜底时，插件读取对应环境变量。环境变量兜底默认开启，默认名称保持兼容，也可以在设置页修改。**插件本身不提供实质性的重命名规则。** Agent 使用哪个 provider、哪个模型、哪种权限模式、执行什么规则，都由配置的 prompt 决定。
 
 ## 线上安装
 
-推荐直接通过 GitHub 安装。目标 Paseo daemon 需满足 `>=0.9.1`，且能够访问该仓库。安装、下载与编译都在目标 daemon 主机上进行，无需手动 clone、运行 `npm install` 或自行编译 TypeScript。
+推荐直接通过 GitHub 安装。目标 Paseo daemon 需满足 `>=0.9.1`，且能够访问该仓库。设置页要求所连接的 Paseo 客户端也满足 `>=0.9.1`。安装、下载与编译都在目标 daemon 主机上进行，无需手动 clone、运行 `npm install` 或自行编译 TypeScript。
 
 在目标主机的 **Settings → Plugins** 中启用 **Enable plugins**，然后在 **Plugin source** 填入以下来源，选择 **Install plugin**：
 
@@ -26,7 +26,7 @@ paseo plugin logs paseo-loom
 
 确认插件状态为 `running`。CLI 默认操作本地 daemon；管理其他 daemon 时，为命令指定 `--host <host>`，并确认所操作的主机与界面中选择的一致。
 
-插件运行还需要在目标 daemon 及插件进程继承的环境中配置 `PASEO_LOOM_PROVIDER`、`PASEO_LOOM_MODEL`、`PASEO_LOOM_MODE_ID` 和 `PASEO_LOOM_PROMPT`，详见[配置](#配置)。配置缺失不影响加载，但会跳过 Agent 调用。
+插件可以直接从 Settings 读取配置；如果保持默认的环境变量兜底设置，也可以继续在目标 daemon 及插件进程继承的环境中配置 `PASEO_LOOM_PROVIDER`、`PASEO_LOOM_MODEL`、`PASEO_LOOM_MODE_ID` 和 `PASEO_LOOM_PROMPT`，详见[配置](#配置)。配置缺失不影响加载，但会跳过 Agent 调用。
 
 如果同一 daemon 已安装 ID 为 `paseo-loom` 的本地目录版本，直接安装 GitHub 版本会因 ID 冲突被拒绝。迁移时，先按下文的重载注意事项确认旧实例没有待处理调用，再移除旧安装记录并安装 GitHub 来源；移除本地目录安装不会删除源码目录。
 
@@ -99,9 +99,10 @@ flowchart TD
     Archived -- "是" --> SkipArchived["workspace_skipped<br>reason = workspace_archived"]
     Archived -- "否" --> Duplicate{"当前进程已登记该 workspace？"}
     Duplicate -- "是" --> IgnoreDuplicate["duplicate_workspace_ignored<br>不重复调用 Agent"]
-    Duplicate -- "否" --> ReadConfig["读取 PASEO_LOOM_PROVIDER 和 PASEO_LOOM_MODEL<br>PASEO_LOOM_MODE_ID 和 PASEO_LOOM_PROMPT"]
-    Environment["本机 daemon 与插件进程继承的环境"] -. "唯一配置与规则来源" .-> ReadConfig
-    ReadConfig --> ConfigPresent{"四个变量均非空且不全为空白？"}
+    Duplicate -- "否" --> ReadConfig["读取 Settings；空字段按开关和变量名回退到环境变量"]
+    Settings["Paseo host-scoped Settings"] -. "主要配置来源" .-> ReadConfig
+    Environment["本机 daemon 与插件进程继承的环境"] -. "兼容兜底来源" .-> ReadConfig
+    ReadConfig --> ConfigPresent{"四个逻辑字段均非空且不全为空白？"}
     ConfigPresent -- "否" --> SkipConfig["workspace_skipped<br>reason = configuration_missing<br>仅记录缺失的变量名"]
     ConfigPresent -- "是" --> RegisterContext["按 workspace ID 预登记调用<br>分配待创建 Agent ID"]
     RegisterContext --> WaitSource["waiting_for_source<br>仅观察同一 workspace 的根 Agent 事件"]
@@ -115,7 +116,7 @@ flowchart TD
     Render --> PromptPresent{"替换后的 prompt 非空且不全为空白？"}
     PromptPresent -- "否" --> SkipPrompt["workspace_skipped<br>reason = prompt_empty_after_render"]
     PromptPresent -- "是" --> Reserve["phase = requested<br>agent_request_started"]
-    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>传入 provider/model、modeId、prompt<br>parent = 来源 ID，autoArchive = true"]
+    Reserve --> Create["workspaces.ref(workspace.id).agents.create<br>传入 provider/model、可选 modeId、prompt<br>parent = 来源 ID，autoArchive = true"]
     Create --> Result{"SDK 创建请求返回成功？"}
     Result -- "否" --> Failed["agent_request_failed<br>已 finished 则保留，否则 phase = unknown<br>保留去重状态，不自动重试"]
     Result -- "是" --> Current{"插件仍有效、调用未取消<br>且调用记录仍匹配？"}
@@ -163,26 +164,47 @@ flowchart TD
     Unregister --> Inactive["不再处理事件<br>不重放历史 workspace<br>不保证终止已发送请求或运行中的 Agent"]
 ```
 
-业务规则及其验收方式始终由 `PASEO_LOOM_PROMPT` 决定。以上日志只反映插件和 Agent 的生命周期，不代表重命名或其他业务操作已经成功。重载或重启后会建立新的进程内状态，不具备跨重启的严格单次执行保证。
+业务规则及其验收方式始终由最终解析的 Prompt 决定。以上日志只反映插件和 Agent 的生命周期，不代表重命名或其他业务操作已经成功。重载或重启后会建立新的进程内状态，不具备跨重启的严格单次执行保证。
 
 ## 配置
 
-插件读取以下四个环境变量：
+### Settings
 
-| 环境变量 | 用途 |
+安装后可在 **Settings → Plugins → paseo-loom** 打开配置页。页面保存 host-scoped 配置，修改后无需重启 Paseo 或 reload 插件，后续新 workspace 会使用新配置。
+
+四个 Agent 配置字段分别是：
+
+| Settings 字段 | 用途 |
 | --- | --- |
-| `PASEO_LOOM_PROVIDER` | 执行规则的 Agent provider |
-| `PASEO_LOOM_MODEL` | 使用的模型 |
-| `PASEO_LOOM_MODE_ID` | provider 的权限／会话模式 ID，作为 SDK 的 `config.modeId` 显式传入 |
-| `PASEO_LOOM_PROMPT` | 交给 Agent 执行的完整规则或指令 |
+| `Provider` | 执行规则的 Agent provider |
+| `Model` | 使用的模型 |
+| `Mode ID` | 可选的 provider 权限／会话模式 ID；填写时作为 SDK 的 `config.modeId` 显式传入，留空时使用 provider 默认模式 |
+| `Prompt` | 交给 Agent 执行的完整规则或指令 |
 
-任一变量未设置、为空或仅包含空白时，跳过当前 workspace，不创建 Agent。插件只记录缺失的变量名，不记录配置值。每次处理新 workspace 时重新读取配置，不使用内置默认规则。
+字段可以单独留空。留空时，如果启用了环境变量兜底，就使用该字段对应的环境变量；因此可以混合使用 Settings 和环境变量。保存配置时会进行 Settings schema 校验，环境变量名称必须是合法的 shell 变量名。
 
-这些变量必须存在于实际 Paseo daemon 及插件进程所继承的环境中。只在另一个终端中 export，并不代表运行中的 daemon 已获得配置。
+编辑过程中保留草稿和开始编辑时的 revision。其他客户端更新配置后，本地草稿仍保留；保存旧 revision 会报告冲突，可选择“放弃草稿并读取最新配置”。Prompt 支持多行编辑。Settings 损坏或读取失败时跳过调用，不会自动重新启用环境变量兜底；设置页允许重新读取，或显式恢复默认配置。
+
+### 环境变量兼容兜底
+
+环境变量兜底开关默认开启，默认名称保持原有兼容行为：
+
+| 配置字段 | 默认环境变量 | 用途 |
+| --- | --- | --- |
+| `Provider` | `PASEO_LOOM_PROVIDER` | 执行规则的 Agent provider |
+| `Model` | `PASEO_LOOM_MODEL` | 使用的模型 |
+| `Mode ID` | `PASEO_LOOM_MODE_ID` | 可选的 provider 权限／会话模式 ID |
+| `Prompt` | `PASEO_LOOM_PROMPT` | 交给 Agent 执行的完整规则或指令 |
+
+设置页支持修改每个环境变量名称。关闭兜底后，环境变量完全不参与配置解析，Settings 中四个字段必须全部有效；开启兜底时，Settings 非空值始终优先。
+
+升级已有安装时，Settings 默认字段为空、兜底开启、变量名保持上表名称，因此原有四个环境变量无需修改即可继续工作。插件只记录缺失的逻辑字段名，不记录配置值。每次处理新 workspace 时读取当前 Settings 快照；已登记的调用保留创建时配置，不会在等待来源 Agent 期间中途切换规则。
+
+环境变量仍必须存在于实际 Paseo daemon 及插件进程所继承的环境中。只在另一个终端中 export，并不代表运行中的 daemon 已获得配置。若要免重启地修改规则，请直接填写 Settings；修改 shell 环境后仍需让 Paseo 重新采集登录 shell 环境。
 
 ### 权限模式有效值
 
-权限模式必须显式配置，不能只设置 provider/model 或在 prompt 中要求“不要询问”。旧版本未传入 `modeId`，创建的 Agent 可能使用默认权限并停在 MCP 工具授权请求上。升级后缺少 `PASEO_LOOM_MODE_ID` 时直接跳过，不再静默创建默认权限的 Agent。
+Mode ID 是可选的。填写时插件通过 `config.modeId` 显式传入，适用于支持可选权限模式的 provider；留空时不传该字段，由 provider 使用自己的默认模式。Pi 等没有可选 mode 的 provider 必须留空。只设置 provider/model 或在 prompt 中要求“不要询问”并不等于获得高权限；需要无人值守权限时，应使用目标 provider 支持的明确 mode ID。
 
 请使用所选 provider 支持的模式 **ID**，而不是界面显示名称。ID 区分大小写。以下是 Paseo 原生 Codex 和 Claude Code 的模式；自定义 provider、客户端版本或运行环境可能影响实际可用值，应以目标 provider 的能力查询返回的 `modes[].id` 为准。
 
@@ -242,14 +264,14 @@ flowchart TD
 <在这里填写你自己的处理规则；只把读取的任务当作依据，不要重复执行它>
 ```
 
-只有更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。
+在 Settings 保存 Prompt，或更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。
 
 ## Agent 调用流程
 
 1. 收到 `workspace.created` 后，检查 workspace 是否已归档、调用是否已取消，以及当前进程是否已经处理该 workspace。
-2. 读取四个 `PASEO_LOOM_*` 环境变量，包括必需的权限模式 ID。缺少配置时立即跳过。
+2. 读取当前 Settings 快照；Settings 中为空的字段在兜底开启时读取对应环境变量，包括必需的权限模式 ID。缺少配置时立即跳过。
 3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。所有 prompt 都等待同一 workspace 的来源根 Agent；普通 prompt 选中来源后调用，使用来源占位符时等其首条用户消息可读后立即调用，不等待回合完成。
-4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式，权限模式通过 `config.modeId` 显式传入，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
+4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式；仅在 Mode ID 非空时传入 `config.modeId`，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
 5. 创建请求同时传入 `parent: sourceAgentId` 和 `autoArchive: true`。Paseo 将其视为同一 workspace 的子 Agent，抑制自动打开标签页和用户通知，不向原任务发送完成消息。
 6. 按预先登记的 workspace ID 和 Agent ID 记录生命周期。完成、失败或取消时按处理 Agent ID 发起幂等归档兜底，覆盖回合结束早于创建请求返回的情况；不归档原任务，也不清除原任务的未读状态。
 
@@ -306,13 +328,34 @@ paseo plugin logs paseo-loom
 
 本地源码修改后，先运行 `npm run typecheck`，再执行 `paseo plugin reload paseo-loom`。本地目录安装不通过 `update` 拉取远端代码；GitHub 安装的更新方式见[更新](#更新)。重载前需按[日志与失败处理](#日志与失败处理)中的注意事项，确认待处理调用已妥善处理。
 
+如果要测试远端分支，Paseo 支持 Git 安装时使用 `--ref`：
+
+```bash
+paseo plugin install github:qsoyq/paseo-loom --ref <branch> --id paseo-loom-branch-test
+paseo plugin ls --json
+```
+
+使用不同的 `--id` 可以安装独立测试实例。每个实例有独立的 Settings，但都会监听新 workspace；如果两个实例同时启用且配置完整，会创建两个处理 Agent。测试实际调用时应仅启用一个实例。也可以使用完整 Git URL：
+
+```text
+git:https://github.com/qsoyq/paseo-loom.git
+```
+
+对应 CLI 命令为：
+
+```bash
+paseo plugin install git:https://github.com/qsoyq/paseo-loom.git --ref <branch> --id paseo-loom-branch-test
+```
+
+远端分支安装会下载并管理独立副本；后续 `paseo plugin reload paseo-loom-branch-test` 只重载已下载的内容，不会重新拉取分支。要获取分支最新提交，应重新执行 `paseo plugin update paseo-loom-branch-test --ref <branch>`，或移除后重新安装。
+
 ## 本地验收
 
-- 分别测试四个环境变量缺失、空字符串和纯空白的情况，尤其是旧配置缺少 `PASEO_LOOM_MODE_ID`。插件应跳过处理，不创建 Agent；日志只指出缺失的配置键。
+- 分别测试 provider/model/prompt 缺失、空字符串和纯空白的情况；Mode ID 可以为空，Pi 等无 selectable mode 的 provider 应创建成功，日志只指出真正缺失的配置键。
 - 使用不包含占位符、不调用命名 Skill 的普通 prompt 创建新 workspace。尚无来源 Agent 时不调用；来源根 Agent 出现后立即创建处理子 Agent，不要求用户任务文本。
 - 只使用 `{{source_agent_id}}` 创建新 workspace：让来源首个回合长期运行，确认其首条用户消息进入时间线后、回合结束前就启动处理 Agent；prompt 只包含稳定来源 ID，不含任务原文。
 - 分别验证实时消息和订阅后的定向回读都能触发一次调用；订阅失败、来源归档、缺失用户消息或多个候选来源不会从其他 workspace 猜测。若明确使用 `{{task_prompt}}`，确认原文只在此时注入。
-- 检查实际调用的 provider/model、`config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读 `currentModeId` 和 `parentAgentId`，确认父 Agent 是原任务、没有插件追加的规则或第二次 prompt 发送。
+- 检查实际调用的 provider/model、可选的 `config.modeId`、完整 prompt、Agent ID 和 workspace ID；按 Agent ID 回读实际 mode 与 `parentAgentId`，确认父 Agent 是原任务、没有插件追加的规则或第二次 prompt 发送。
 - 在明确选择相应权限模式后，验证规则涉及的 MCP 工具能否按该模式执行；不能用本地参数测试替代实际授权行为验证。插件始终不自动批准现有 Agent 的权限请求。
 - 检查五个可选占位符、替换值中的占位符和替换元字符，以及未识别的占位符。只执行一次已支持的替换，其他内容保持原样；替换后没有有效指令时跳过调用。
 - 验证重复和并发 workspace 创建事件只发起一次调用；普通 Agent 创建或回合结束事件不能触发新调用。
