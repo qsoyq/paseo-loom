@@ -13,6 +13,7 @@ const source = {
 };
 const taskItem = (text = "Original user task") => ({ type: "user_message", text });
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+const multilineTask = "/tmp/CuaDriver.md\n\n如何检查 CuaDriver 授权或解除授权？\n\n[User] is literal data\n```text\n{{workspace_id}} $&\n```\n";
 
 function deferred() {
   let resolve, reject;
@@ -44,6 +45,7 @@ function harness(t, options = {}) {
   const archives = [];
   const refetches = [];
   const released = [];
+  const history = [...(options.history ?? [])];
   const abort = new AbortController();
   let settingsListener;
   let settingsValues = options.settings ?? {
@@ -103,7 +105,7 @@ function harness(t, options = {}) {
             async refetch(query) {
               refetches.push({ id, query });
               if (options.onRefetch) return options.onRefetch(query, h);
-              return { entries: (options.history ?? []).map((item) => ({ item })) };
+              return { entries: history.map((item) => ({ item })), hasOlder: false };
             },
           },
         };
@@ -154,6 +156,7 @@ function harness(t, options = {}) {
       await h.emit("agent.turn_ended", { agent, outcome, timeline: [] });
     },
     async message(item = taskItem(), agentId = source.id) {
+      if (agentId === source.id) history.push(item);
       timelineListeners.get(agentId)?.({
         agentId, event: { type: "timeline", item },
       });
@@ -330,7 +333,7 @@ test("plain prompt waits for the root and creates one child without changing con
   assert.equal(h.creations.length, 1);
   const created = h.creations[0];
   assert.equal(created.parent, source.id);
-  assert.equal(created.autoArchive, true);
+  assert.equal(created.autoArchive, false);
   assert.deepEqual(created.config, {
     provider: "configured-provider/configured-model", modeId: "configured-mode",
   });
@@ -354,13 +357,131 @@ test("other workspaces and delegated agents cannot become sources or cause ambig
   assert.equal(h.logs.some((entry) => entry.event === "source_ambiguous"), false);
 });
 
+for (const via of ["live", "readback", "turn_end"]) {
+  test(`${via} preserves the entire multiline task without recursive interpolation`, async (t) => {
+    const h = harness(t, {
+      prompt: "<source_task>\n{{task_prompt}}\n</source_task>",
+      history: via === "live" ? [] : [taskItem(multilineTask)],
+    });
+    await h.open();
+    if (via === "turn_end") await h.finish({ kind: "completed" }, source);
+    else {
+      await h.emit("agent.created", { agent: source });
+      if (via === "live") await h.message(taskItem(multilineTask));
+    }
+    assert.equal(h.creations.length, 1);
+    assert.equal(h.creations[0].prompt, `<source_task>\n${multilineTask}\n</source_task>`);
+    assert.equal(h.logs.some((entry) => entry.event === "source_task_available" && entry.via === via), true);
+    assert.equal(JSON.stringify(h.logs).includes("CuaDriver"), false);
+  });
+}
+
+for (const via of ["readback", "turn_end", "live"]) {
+  test(`${via} pages beyond 100 entries before choosing the original task`, async (t) => {
+    let ready = via !== "live";
+    const h = harness(t, {
+      prompt: "{{task_prompt}}",
+      onRefetch(query) {
+        if (!ready) return { entries: [], hasOlder: false };
+        if (query.direction === "tail") return {
+          entries: [taskItem("Later user task"), ...Array.from({ length: 99 }, () => ({ type: "assistant_message", text: "output" }))].map((item) => ({ item })),
+          hasOlder: true, startCursor: { epoch: "epoch-1", seq: 100 },
+        };
+        assert.deepEqual(query.cursor, { epoch: "epoch-1", seq: 100 });
+        return { entries: [{ item: taskItem(multilineTask) }], hasOlder: false, startCursor: { epoch: "epoch-1", seq: 0 } };
+      },
+    });
+    await h.open();
+    if (via === "turn_end") await h.finish({ kind: "completed" }, source);
+    else {
+      await h.emit("agent.created", { agent: source });
+      if (via === "live") {
+        ready = true;
+        await h.message(taskItem("Newest user task"));
+      }
+    }
+    assert.equal(h.creations[0].prompt, multilineTask);
+  });
+}
+
+for (const fault of ["missing_cursor", "repeated_cursor", "changed_epoch", "error"]) {
+  test(`${fault} cannot promote a later message to the original task`, async (t) => {
+    const h = harness(t, {
+      prompt: "{{task_prompt}}",
+      onRefetch(query) {
+        return {
+          entries: [{ item: taskItem("Not the original task") }],
+          hasOlder: true,
+          startCursor: fault === "missing_cursor" ? null : {
+            epoch: fault === "changed_epoch" && query.cursor ? "epoch-2" : "epoch-1",
+            seq: 100,
+          },
+          ...(fault === "error" ? { error: "History unavailable" } : {}),
+        };
+      },
+    });
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    await h.message();
+    assert.equal(h.creations.length, 0);
+    assert.equal(h.logs.some((entry) => entry.event === "source_observation_failed"), true);
+  });
+}
+
+test("a subsequent live event can recover after history becomes readable", async (t) => {
+  let readable = false;
+  const h = harness(t, {
+    prompt: "{{task_prompt}}",
+    onRefetch() {
+      if (!readable) throw new Error("History unavailable");
+      return { entries: [{ item: taskItem(multilineTask) }], hasOlder: false };
+    },
+  });
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.equal(h.creations.length, 0);
+  readable = true;
+  await h.message(taskItem("Later follow-up"));
+  assert.equal(h.creations[0].prompt, multilineTask);
+});
+
+test("an older page without user messages retains the earliest task already found", async (t) => {
+  const h = harness(t, {
+    prompt: "{{task_prompt}}",
+    onRefetch(query) {
+      return query.cursor
+        ? { entries: [], hasOlder: false, startCursor: null }
+        : { entries: [{ item: taskItem(multilineTask) }], hasOlder: true, startCursor: { epoch: "epoch-1", seq: 100 } };
+    },
+  });
+  await h.open();
+  await h.emit("agent.created", { agent: source });
+  assert.equal(h.creations[0].prompt, multilineTask);
+  assert.equal(h.refetches.length, 2);
+});
+
+test("a live follow-up cannot outrun the initial history read", async (t) => {
+  const read = deferred();
+  const h = harness(t, { prompt: "{{task_prompt}}", onRefetch: () => read.promise });
+  await h.open();
+  const hook = h.emit("agent.created", { agent: source });
+  await flush();
+  await h.message(taskItem("Later follow-up"));
+  assert.equal(h.creations.length, 0);
+  read.resolve({ entries: [{ item: taskItem(multilineTask) }], hasOlder: false });
+  await hook;
+  await flush();
+  assert.equal(h.creations.length, 1);
+  assert.equal(h.creations[0].prompt, multilineTask);
+});
+
 test("source ID prompt waits for a live user message and does not copy user text", async (t) => {
   const h = harness(t, { prompt: "Read {{source_agent_id}}" });
   await h.open();
   await h.emit("agent.created", { agent: source });
   await h.message(taskItem("   "));
   assert.equal(h.creations.length, 0);
-  await h.message();
+  await h.message(taskItem(multilineTask));
   assert.equal(h.creations[0].prompt, "Read source-1");
   assert.equal(h.creations[0].parent, source.id);
   assert.deepEqual(h.released, [source.id]);
@@ -416,13 +537,17 @@ test("a child finishing before create returns is archived without losing its ter
   assert.equal(h.logs.find((entry) => entry.event === "agent_request_completed").phase, "finished");
 });
 
-test("daemon auto-archive before the terminal hook does not trigger another archive", async (t) => {
-  const h = harness(t);
-  await h.open();
-  await h.emit("agent.created", { agent: source });
-  await h.emit("agent.archived", { agent: h.child(), archivedAt: "2026-10-03T00:00:00Z" });
-  await h.finish();
-  assert.deepEqual(h.archives, []);
+test("external archive and terminal hooks in either order never duplicate plugin archive", async (t) => {
+  for (const archiveFirst of [true, false]) {
+    const h = harness(t);
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    assert.equal(h.creations[0].autoArchive, false);
+    if (!archiveFirst) await h.finish();
+    await h.emit("agent.archived", { agent: h.child(), archivedAt: "2026-10-03T00:00:00Z" });
+    await h.finish();
+    assert.equal(h.archives.length, archiveFirst ? 0 : 1);
+  }
 });
 
 test("archive failure is logged without rerunning the task or archiving the source", async (t) => {
@@ -458,11 +583,12 @@ test("source turn end recovers a missed source-created event for a plain prompt"
 test("source turn end supplies requested context when timeline observation failed", async (t) => {
   const h = harness(t, {
     prompt: "{{task_prompt}}", subscriptionError: new Error("Subscription unavailable"),
+    history: [taskItem()],
   });
   await h.open();
   await h.emit("agent.created", { agent: source });
   assert.equal(h.creations.length, 0);
-  await h.emit("agent.turn_ended", { agent: source, outcome: { kind: "completed" }, timeline: [taskItem()] });
+  await h.finish({ kind: "completed" }, source);
   assert.equal(h.creations[0].prompt, "Original user task");
 });
 
@@ -541,7 +667,9 @@ test("readback from a released observation cannot supply a stale task", async (t
   const h = harness(t, {
     prompt: "{{task_prompt}}",
     onRefetch(_query, fixture) {
-      return fixture.refetches.length === 1 ? readback.promise : { entries: [] };
+      return fixture.refetches.length === 1 ? readback.promise : {
+        entries: fixture.refetches.length === 2 ? [] : [{ item: taskItem("Current task") }],
+      };
     },
   });
   await h.open();
@@ -578,6 +706,7 @@ for (const type of ["error", "timeline"]) {
   test(`a synchronous ${type} callback releases its handle and consumes ready rejection`, async (t) => {
     const h = harness(t, {
       prompt: "{{task_prompt}}",
+      history: [taskItem()],
       onSubscribe(subscription) {
         subscription.ready = Promise.reject(new Error("Acknowledgement failed"));
         subscription.listener({ agentId: source.id, event: { type, item: taskItem() } });
@@ -594,7 +723,7 @@ for (const type of ["error", "timeline"]) {
 }
 
 for (const via of ["initial", "restored"]) {
-  test(`a failed ${via} readback preserves live observation`, async (t) => {
+  test(`a failed ${via} readback preserves observation but cannot select a later live task`, async (t) => {
     const h = harness(t, {
       prompt: "{{task_prompt}}",
       onRefetch() { throw new Error("History unavailable"); },
@@ -607,7 +736,8 @@ for (const via of ["initial", "restored"]) {
     }
     assert.deepEqual(h.released, []);
     await h.message();
-    assert.equal(h.creations[0].prompt, "Original user task");
+    assert.equal(h.creations.length, 0);
+    assert.equal(h.logs.some((entry) => entry.event === "source_observation_failed"), true);
   });
 }
 

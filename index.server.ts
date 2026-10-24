@@ -248,6 +248,51 @@ export default function contribute(server: PluginServerContext) {
     await startAgent(invocation, context);
   }
 
+  async function readSourceTask(
+    invocation: AgentInvocation,
+    context: PluginHookContext,
+    via: "live" | "readback" | "turn_end",
+    isCurrent: () => boolean,
+  ) {
+    const sourceAgentId = invocation.sourceAgentId;
+    if (!sourceAgentId) return;
+    const timeline = context.paseo.agents.ref(sourceAgentId).timeline;
+    type Page = Awaited<ReturnType<typeof timeline.refetch>>;
+    let cursor: NonNullable<Page["startCursor"]> | undefined;
+    let task: string | undefined;
+    const seen = new Set<string>();
+    while (isCurrent() && !context.signal.aborted) {
+      const page = await timeline.refetch({
+        direction: cursor ? "before" : "tail", limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!isCurrent() || context.signal.aborted) return;
+      if (page.error) throw new Error(page.error);
+      if (cursor && page.startCursor && page.startCursor.epoch !== cursor.epoch) {
+        throw new Error("Source timeline changed during pagination");
+      }
+      const first = page.entries.find(
+        (entry) => entry.item.type === "user_message" && entry.item.text.trim(),
+      );
+      if (first?.item.type === "user_message") task = first.item.text;
+      if (!page.hasOlder) {
+        if (task !== undefined) {
+          await sourceTaskAvailable(invocation, sourceAgentId, task, context, via);
+        } else if (via === "turn_end") {
+          log("source_task_unavailable", { workspaceId: invocation.workspace.id });
+        }
+        return;
+      }
+      const next = page.startCursor;
+      if (!next || seen.has(JSON.stringify(next)) ||
+        (cursor && next.seq >= cursor.seq)) {
+        throw new Error("Source timeline pagination did not advance");
+      }
+      seen.add(JSON.stringify(next));
+      cursor = next;
+    }
+  }
+
   async function watchSource(invocation: AgentInvocation, context: PluginHookContext) {
     const sourceAgentId = invocation.sourceAgentId;
     if (
@@ -296,26 +341,8 @@ export default function contribute(server: PluginServerContext) {
         paseo: context.paseo,
         signal: invocation.abort.signal,
       };
-      const readSourceTimeline = async () => {
-        if (!isCurrent()) {
-          return;
-        }
-        const timeline = await agent.timeline.refetch({ direction: "tail", limit: 100 });
-        if (!isCurrent()) {
-          return;
-        }
-        if (timeline.error) {
-          throw new Error(timeline.error);
-        }
-        const firstTask = timeline.entries.find(
-          (entry) => entry.item.type === "user_message" && entry.item.text.trim(),
-        );
-        if (firstTask?.item.type === "user_message") {
-          await sourceTaskAvailable(
-            invocation, sourceAgentId, firstTask.item.text, liveContext, "readback",
-          );
-        }
-      };
+      const readSourceTimeline = (via: "live" | "readback" = "readback") =>
+        readSourceTask(invocation, liveContext, via, isCurrent);
       const subscription = agent.timeline.subscribe((event) => {
         if (!isCurrent()) {
           return;
@@ -333,9 +360,9 @@ export default function contribute(server: PluginServerContext) {
           event.event.type === "timeline" &&
           event.event.item.type === "user_message"
         ) {
-          void sourceTaskAvailable(
-            invocation, sourceAgentId, event.event.item.text, liveContext, "live",
-          );
+          // Live delivery can race history or follow a reconnect. Confirm the
+          // earliest message from structured history before selecting a task.
+          void readSourceTimeline("live").catch(readbackFailed);
         }
       });
       observation.subscription = subscription;
@@ -394,7 +421,8 @@ export default function contribute(server: PluginServerContext) {
       await context.paseo.workspaces.ref(workspace.id).agents.create({
         agentId: invocation.agentId,
         parent: invocation.sourceAgentId,
-        autoArchive: true,
+        // The terminal hook is the sole archive owner, including fast completions.
+        autoArchive: false,
         config: {
           provider: `${invocation.configuration.provider}/${invocation.configuration.model}`,
           ...(invocation.configuration.modeId
@@ -516,14 +544,18 @@ export default function contribute(server: PluginServerContext) {
         await startAgent(pending, context);
         return;
       }
-      const task = event.timeline.find(
-        (item) => item.type === "user_message" && item.text.trim(),
-      );
-      if (!task || task.type !== "user_message") {
-        log("source_task_unavailable", { workspaceId });
-        return;
+      try {
+        await readSourceTask(pending, context, "turn_end", () =>
+          !stopped && pending.phase === "waiting" &&
+          !pending.abort.signal.aborted &&
+          invocations.get(pending.workspace.id) === pending,
+        );
+      } catch (error) {
+        log("source_observation_failed", {
+          workspaceId, sourceAgentId: event.agent.id,
+          error: error instanceof Error ? error.message : String(error),
+        }, true);
       }
-      await sourceTaskAvailable(pending, event.agent.id, task.text, context, "turn_end");
       return;
     }
     if (invocation.phase === "finished") {
