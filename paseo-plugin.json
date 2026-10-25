@@ -1,5 +1,6 @@
 {
   "id": "paseo-loom",
+  "description": "新 workspace 自动调用配置的子 Agent 执行任务，结束后自动归档。",
   "requirements": {
     "paseo": ">=0.9.1"
   }
