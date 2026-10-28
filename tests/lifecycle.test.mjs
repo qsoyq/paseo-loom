@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import contribute from "../index.server.ts";
 import { loomSettings, defaultLoomSettings } from "../shared/settings.ts";
 
@@ -46,6 +47,7 @@ function harness(t, options = {}) {
   const refetches = [];
   const released = [];
   const history = [...(options.history ?? [])];
+  let activeTurnId;
   const abort = new AbortController();
   let settingsListener;
   let settingsValues = options.settings ?? {
@@ -105,7 +107,12 @@ function harness(t, options = {}) {
             async refetch(query) {
               refetches.push({ id, query });
               if (options.onRefetch) return options.onRefetch(query, h);
-              return { entries: history.map((item) => ({ item })), hasOlder: false };
+              return {
+                epoch: "epoch-1", hasOlder: false,
+                entries: history.map((value, seq) => ({
+                  seqStart: seq, seqEnd: seq, ...(value.item ? value : { item: value }),
+                })),
+              };
             },
           },
         };
@@ -152,11 +159,15 @@ function harness(t, options = {}) {
       assert.equal(creations.length, 1);
       return { ...source, id: creations[0].agentId, parentAgentId: source.id };
     },
-    async finish(outcome = { kind: "completed" }, agent = h.child()) {
-      await h.emit("agent.turn_ended", { agent, outcome, timeline: [] });
+    async start(turnId = "turn-1") {
+      activeTurnId = turnId;
+      await h.emit("agent.turn_started", { agent: source, turnId });
+    },
+    async finish(outcome = { kind: "completed" }, agent = h.child(), turnId = activeTurnId ?? null) {
+      await h.emit("agent.turn_ended", { agent, turnId, outcome, timeline: [] });
     },
     async message(item = taskItem(), agentId = source.id) {
-      if (agentId === source.id) history.push(item);
+      if (agentId === source.id) history.push({ item, ...(activeTurnId ? { turnId: activeTurnId } : {}) });
       timelineListeners.get(agentId)?.({
         agentId, event: { type: "timeline", item },
       });
@@ -756,6 +767,342 @@ for (const stop of ["cleanup", "workspace.archived", "agent.archived"]) {
     assert.deepEqual(h.released, [source.id]);
   });
 }
+
+const summaryPrompt = "Task: {{task_prompt}}\nSummary: {{source_summary}}";
+const assistant = (text, messageId) => ({ type: "assistant_message", text, ...(messageId ? { messageId } : {}) });
+const turnEntry = (item, seq, turnId = "turn-1") => ({ item, seqStart: seq, seqEnd: seq, ...(turnId ? { turnId } : {}) });
+const summaryPage = (entries, extra = {}) => ({ epoch: "epoch-1", entries, hasOlder: false, ...extra });
+
+for (const turnId of ["turn-1", null]) {
+  test(`summary waits for the first completed turn (${turnId}) and preserves literal text`, async (t) => {
+    const h = harness(t, { prompt: summaryPrompt, history: [taskItem(multilineTask)] });
+    await h.open();
+    await h.emit("agent.created", { agent: source });
+    await h.start(turnId);
+    await h.message(assistant("Progress only", "progress"));
+    await h.message({ type: "reasoning", text: "Private reasoning" });
+    await h.message(assistant("Result {{source_summary}} $&", "final"));
+    await h.message(assistant("\n\nSecond paragraph", "final"));
+    await h.message({ type: "notification", level: "info", message: "Finished" });
+    assert.equal(h.creations.length, 0);
+    await h.finish({ kind: "completed" }, source);
+    assert.equal(h.creations[0].prompt, `Task: ${multilineTask}\nSummary: Result {{source_summary}} $&\n\nSecond paragraph`);
+    assert.equal(h.creations[0].parent, source.id);
+    assert.deepEqual(h.released, [source.id]);
+    assert.equal(h.refetches.at(-1).query.projection, "canonical");
+    assert.equal(JSON.stringify(h.logs).includes("Second paragraph"), false);
+    await h.finish();
+    assert.deepEqual(h.archives, [h.child().id]);
+  });
+}
+
+test("summary-only templates do not inject task text or start on assistant streaming", async (t) => {
+  const h = harness(t, { prompt: "Reply: {{source_summary}}", history: [taskItem("Private task")] });
+  await h.open();
+  await h.start();
+  await h.message(assistant("Completed result"));
+  assert.equal(h.creations.length, 0);
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Reply: Completed result");
+});
+
+test("summary excludes earlier assistant messages with different IDs", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt });
+  await h.open();
+  await h.start();
+  await h.message();
+  await h.message(assistant("Progress", "progress"));
+  await h.message(assistant("Final", "final"));
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: Final");
+});
+
+test("summary reads across pages and never uses a second-turn answer", async (t) => {
+  const entries = [turnEntry(taskItem(), 0), turnEntry(assistant("First part", "final"), 1),
+    turnEntry(assistant("\n\nSecond part", "final"), 2), turnEntry(taskItem("Follow-up"), 3, "turn-2"),
+    ...Array.from({ length: 101 }, (_, i) => turnEntry(assistant("Wrong topic"), i + 4, "turn-2"))];
+  let completed = false;
+  const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+    if (!completed) return summaryPage(entries.slice(0, 1));
+    if (!query.cursor) return summaryPage(entries.slice(2), { hasOlder: true, startCursor: { epoch: "epoch-1", seq: 2 } });
+    assert.equal(query.cursor.seq, 2);
+    return summaryPage(entries.slice(0, 2));
+  } });
+  await h.open();
+  await h.start();
+  completed = true;
+  await h.finish({ kind: "completed" }, source, "turn-1");
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: First part\n\nSecond part");
+});
+
+for (const kind of ["failed", "canceled"]) {
+  test(`summary stops on ${kind} and does not follow a later successful turn`, async (t) => {
+    const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+    await h.open();
+    await h.start();
+    await h.message(assistant("Partial result"));
+    await h.finish({ kind }, source);
+    await h.start("turn-2");
+    await h.message(assistant("Later result"));
+    await h.finish({ kind: "completed" }, source);
+    assert.equal(h.creations.length, 0);
+    assert.deepEqual(h.archives, []);
+    assert.equal(h.logs.some((entry) => entry.reason === `source_turn_${kind}`), true);
+  });
+}
+
+test("permission wait is not terminal for a summary template", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+  await h.open();
+  await h.start();
+  await h.emit("agent.permission_requested", { agent: source, request: { kind: "question" } });
+  assert.equal(h.creations.length, 0);
+  await h.message(assistant("Final result"));
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations.length, 1);
+});
+
+for (const fault of ["empty", "read_error", "changed_epoch", "gap", "reset", "stale_cursor", "missing_cursor", "repeated_cursor", "overlap", "missing_turn_id", "reused_turn_id", "later_turn_only"]) {
+  test(`summary ${fault} falls back once to the confirmed original task`, async (t) => {
+    let completed = false;
+    const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+      const first = turnEntry(taskItem(), 0);
+      if (!completed) return summaryPage([first]);
+      if (fault === "read_error") throw new Error("secret-provider-output");
+      if (fault === "empty") return summaryPage([first]);
+      if (fault === "missing_turn_id") return summaryPage([first, turnEntry(assistant("Unscoped"), 1, null)]);
+      if (fault === "reused_turn_id") return summaryPage([first, turnEntry(assistant("First"), 1), turnEntry(taskItem("Second"), 2), turnEntry(assistant("Second"), 3)]);
+      if (fault === "later_turn_only") return summaryPage([first, turnEntry(taskItem("Second"), 1, "turn-2"), turnEntry(assistant("Second"), 2, "turn-2")]);
+      if (fault === "missing_cursor") return summaryPage([first], { hasOlder: true });
+      if (fault === "repeated_cursor") return summaryPage([first], { hasOlder: true, startCursor: { epoch: "epoch-1", seq: 1 } });
+      const page = summaryPage([first, turnEntry(assistant("Do not use"), fault === "overlap" ? 0 : 1)]);
+      if (fault === "changed_epoch") page.epoch = "epoch-2";
+      if (fault === "gap") page.gap = true;
+      if (fault === "reset") page.reset = true;
+      if (fault === "stale_cursor") page.staleCursor = true;
+      return page;
+    } });
+    await h.open();
+    await h.start();
+    completed = true;
+    await h.finish({ kind: "completed" }, source);
+    await h.finish({ kind: "completed" }, source);
+    assert.equal(h.creations.length, 1);
+    assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: ");
+    assert.equal(h.logs.some((entry) => entry.event === "source_summary_unavailable"), true);
+    assert.equal(JSON.stringify(h.logs).includes("secret-provider-output"), false);
+  });
+}
+
+for (const turnId of ["turn-1", null]) {
+  test(`terminal-only observation (${turnId}) does not trust deprecated event.timeline`, async (t) => {
+    const h = harness(t, { prompt: summaryPrompt, onRefetch: () => summaryPage([
+      turnEntry(taskItem(), 0, turnId), turnEntry(assistant("Actual reply"), 1, turnId),
+    ]) });
+    await h.open();
+    await h.emit("agent.turn_ended", { agent: source, turnId, outcome: { kind: "completed" }, timeline: [assistant("Wrong event data")] });
+    assert.equal(h.creations[0].prompt, `Task: Original user task\nSummary: ${turnId ? "Actual reply" : ""}`);
+  });
+}
+
+test("summary recovers a failed subscription at the terminal hook", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, subscriptionError: new Error("Offline"), onRefetch: () => summaryPage([
+    turnEntry(taskItem(), 0), turnEntry(assistant("Actual reply"), 1),
+  ]) });
+  await h.open();
+  await h.start();
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: Actual reply");
+});
+
+for (const fault of ["read_error", "no_user"]) {
+  test(`summary ${fault} without a confirmed task stops without retry`, async (t) => {
+    const h = harness(t, { prompt: summaryPrompt, onRefetch() {
+      if (fault === "read_error") throw new Error("Unavailable");
+      return summaryPage([turnEntry(assistant("Unattributed reply"), 0)]);
+    } });
+    await h.open();
+    await h.finish({ kind: "completed" }, source, "turn-1");
+    await h.start("turn-2");
+    await h.finish({ kind: "completed" }, source);
+    assert.equal(h.creations.length, 0);
+    assert.equal(h.logs.some((entry) => entry.reason === "source_context_unavailable"), true);
+  });
+}
+
+for (const stop of ["cleanup", "workspace.archived", "agent.archived", "ambiguous_source", "aborted_hook"]) {
+  test(`${stop} invalidates in-flight summary readback`, async (t) => {
+    const readback = deferred();
+    const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+      return query.projection === "canonical" ? readback.promise : summaryPage([turnEntry(taskItem(), 0)]);
+    } });
+    await h.open();
+    await h.start();
+    const hook = h.finish({ kind: "completed" }, source);
+    await flush();
+    if (stop === "cleanup") h.cleanup();
+    else if (stop === "aborted_hook") h.abort.abort();
+    else if (stop === "ambiguous_source") await h.emit("agent.created", { agent: { ...source, id: "source-2" } });
+    else await h.emit(stop, { agent: source, workspace, archivedAt: "2026-10-03T00:00:00Z" });
+    readback.resolve(summaryPage([turnEntry(taskItem(), 0), turnEntry(assistant("Late reply"), 1)]));
+    await hook;
+    assert.equal(h.creations.length, 0);
+  });
+}
+
+for (const turnId of ["turn-1", null]) {
+  test(`duplicate terminal hooks and a new turn (${turnId}) cannot race summary creation`, async (t) => {
+    const readback = deferred();
+    const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+      return query.projection === "canonical" ? readback.promise : summaryPage([turnEntry(taskItem(), 0, turnId)]);
+    } });
+    await h.open();
+    await h.start(turnId);
+    const hook = h.finish({ kind: "completed" }, source);
+    await flush();
+    await h.finish({ kind: "completed" }, source, turnId);
+    await h.start(turnId ? "turn-2" : null);
+    readback.resolve(summaryPage([turnEntry(taskItem(), 0, turnId), turnEntry(assistant("First reply"), 1, turnId)]));
+    await hook;
+    assert.equal(h.creations.length, 1);
+    assert.equal(h.creations[0].prompt, `Task: Original user task\nSummary: ${turnId ? "First reply" : ""}`);
+    assert.equal(h.refetches.filter(({ query }) => query.projection === "canonical").length, 1);
+  });
+}
+
+test("a mismatching terminal turn stops rather than waits for another round", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+  await h.open();
+  await h.start();
+  await h.finish({ kind: "completed" }, source, "turn-2");
+  await h.finish({ kind: "completed" }, source, "turn-1");
+  assert.equal(h.creations.length, 0);
+  assert.equal(h.logs.some((entry) => entry.reason === "source_turn_mismatch"), true);
+});
+
+test("a stale live read cannot overwrite terminal source context", async (t) => {
+  const readback = deferred();
+  const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+    return query.projection === "canonical"
+      ? summaryPage([turnEntry(taskItem("Current task"), 0), turnEntry(assistant("Current reply"), 1)]) : readback.promise;
+  } });
+  await h.open();
+  const live = h.start();
+  await flush();
+  await h.finish({ kind: "completed" }, source, "turn-1");
+  readback.resolve(summaryPage([turnEntry(taskItem("Stale task"), 0)]));
+  await live;
+  assert.equal(h.creations.length, 1);
+  assert.equal(h.creations[0].prompt, "Task: Current task\nSummary: Current reply");
+});
+
+test("repository naming template receives synthetic handoff context without exposing it in logs", async (t) => {
+  const prompt = readFileSync(new URL("../prompts/workspace-naming.md", import.meta.url), "utf8");
+  const h = harness(t, { prompt });
+  await h.open();
+  await h.start();
+  await h.message(taskItem("根据聊天记录分析问题并给出建议"));
+  await h.message(assistant("示例缓存服务的过期时间解析错误。建议校验输入；尚未修改实现。"));
+  assert.equal(h.creations.length, 0);
+  await h.finish({ kind: "completed" }, source);
+  assert.ok(h.creations[0].prompt.includes("<source_summary>\n示例缓存服务"));
+  assert.ok(h.creations[0].prompt.includes("原始任务决定"));
+  assert.equal(JSON.stringify(h.logs).includes("示例缓存服务"), false);
+});
+
+test("canonical text fragments are concatenated without inserting whitespace", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+  await h.open();
+  await h.start();
+  await h.message(assistant("缓存", "final"));
+  await h.message(assistant("过期时间", "final"));
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: 缓存过期时间");
+});
+
+for (const turnId of ["turn-1", null]) {
+  test(`repeated or missing turn ID (${turnId}) without a new user message is ambiguous`, async (t) => {
+    const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+    await h.open();
+    await h.start(turnId);
+    await h.start(turnId);
+    await h.message(assistant("Could belong to a later turn"));
+    await h.finish({ kind: "completed" }, source);
+    assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: ");
+  });
+}
+
+test("an epoch change on an older summary page discards the entire read", async (t) => {
+  let completed = false;
+  const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+    if (!completed) return summaryPage([turnEntry(taskItem(), 0)]);
+    if (!query.cursor) return summaryPage([turnEntry(assistant("Tail"), 1)], { hasOlder: true, startCursor: { epoch: "epoch-1", seq: 1 } });
+    return summaryPage([turnEntry(taskItem(), 0)], { epoch: "epoch-2" });
+  } });
+  await h.open();
+  await h.start();
+  completed = true;
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: ");
+});
+
+test("new Settings cannot change an already waiting summary invocation", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+  await h.open();
+  await h.start();
+  await h.updateSettings({ ...defaultLoomSettings, prompt: "Immediate rename" });
+  await h.message(assistant("Original settings"));
+  assert.equal(h.creations.length, 0);
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: Original settings");
+});
+
+test("notification boundaries do not join unrelated assistant text", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, history: [taskItem()] });
+  await h.open();
+  await h.start();
+  await h.message(assistant("Unrelated progress"));
+  await h.message({ type: "notification", level: "info", message: "Boundary" });
+  await h.message(assistant("Final reply"));
+  await h.message({ type: "todo", items: [] });
+  await h.finish({ kind: "completed" }, source);
+  assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: Final reply");
+});
+
+for (const turnId of ["turn-1", null]) {
+  test(`a later turn (${turnId}) starting during pagination invalidates ambiguous IDs`, async (t) => {
+    const readback = deferred();
+    const h = harness(t, { prompt: summaryPrompt, onRefetch(query) {
+      return query.projection === "canonical" ? readback.promise : summaryPage([turnEntry(taskItem(), 0, turnId)]);
+    } });
+    await h.open();
+    await h.start(turnId);
+    const hook = h.finish({ kind: "completed" }, source);
+    await flush();
+    await h.start(turnId);
+    readback.resolve(summaryPage([turnEntry(taskItem(), 0, turnId), turnEntry(assistant("Ambiguous reply"), 1, turnId)]));
+    await hook;
+    assert.equal(h.creations[0].prompt, "Task: Original user task\nSummary: ");
+  });
+}
+
+test("malformed summary history cannot establish an unconfirmed user task", async (t) => {
+  const h = harness(t, { prompt: summaryPrompt, onRefetch: () => summaryPage([
+    turnEntry(taskItem(), 1), turnEntry(assistant("Overlapping entry"), 1),
+  ]) });
+  await h.open();
+  await h.finish({ kind: "completed" }, source, "turn-1");
+  assert.equal(h.creations.length, 0);
+  assert.equal(h.logs.some((entry) => entry.reason === "source_context_unavailable"), true);
+});
+
+test("template retains only generic placeholders and no concrete identity or endpoints", () => {
+  const prompt = readFileSync(new URL("../prompts/workspace-naming.md", import.meta.url), "utf8");
+  const placeholders = [...prompt.matchAll(/\{\{([^}]+)\}\}/g)].map((match) => match[1]);
+  assert.deepEqual(placeholders, ["workspace_id", "cwd", "workspace_title", "source_agent_id", "task_prompt", "source_summary"]);
+  assert.doesNotMatch(prompt, /\/Users\/|\/home\/|https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+  assert.doesNotMatch(prompt, /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
+});
 
 test("source pause, cancellation and archive after launch leave the child running", async (t) => {
   const h = harness(t);
