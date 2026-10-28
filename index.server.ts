@@ -11,6 +11,18 @@ type PaseoAgentTimelineSubscription = ReturnType<
   ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>["timeline"]["subscribe"]
 >;
 
+type SourceTimelinePage = Awaited<ReturnType<
+  ReturnType<PluginHookContext["paseo"]["agents"]["ref"]>["timeline"]["refetch"]
+>>;
+type SourceTaskCursor = NonNullable<SourceTimelinePage["startCursor"]>;
+type SourceSummary = {
+  turnId?: string | null;
+  ended: boolean;
+  ready: boolean;
+  ambiguousTurn: boolean;
+  text: string;
+};
+
 type LoomConfiguration = {
   provider: string;
   model: string;
@@ -29,6 +41,8 @@ type AgentInvocation = {
   sourceAgentId?: string;
   sourceTask?: string;
   sourceTaskReady?: boolean;
+  sourceTaskCursor?: SourceTaskCursor;
+  sourceSummary?: SourceSummary;
   sourceObservation?: SourceObservation;
   archiveRequested?: boolean;
   archived?: boolean;
@@ -96,16 +110,57 @@ function renderPrompt(template: string, invocation: AgentInvocation) {
     workspace_title: invocation.workspace.name ?? "",
     source_agent_id: invocation.sourceAgentId ?? "",
     task_prompt: invocation.sourceTask ?? "",
+    source_summary: invocation.sourceSummary?.text ?? "",
   };
   return template.replace(
-    /\{\{(workspace_id|cwd|workspace_title|source_agent_id|task_prompt)\}\}/g,
+    /\{\{(workspace_id|cwd|workspace_title|source_agent_id|task_prompt|source_summary)\}\}/g,
     (_token, key: string) => values[key],
   );
 }
 
 function needsSourceTask(configuration: LoomConfiguration) {
   return configuration.prompt.includes("{{source_agent_id}}") ||
-    configuration.prompt.includes("{{task_prompt}}");
+    configuration.prompt.includes("{{task_prompt}}") ||
+    configuration.prompt.includes("{{source_summary}}");
+}
+
+// Only the first user-message interval may supply context. A provider turn ID
+// alone is insufficient: it can be absent or reused after reopening a session.
+function firstTurnReply(
+  entries: SourceTimelinePage["entries"],
+  firstUser: number,
+  turnId: string | null,
+  summary: SourceSummary,
+) {
+  const nextUser = entries.findIndex((entry, index) =>
+    index > firstUser && entry.item.type === "user_message",
+  );
+  if (summary.ambiguousTurn) return "";
+  if (turnId === null && (summary.turnId !== null || nextUser !== -1)) return "";
+  if (turnId !== null && nextUser !== -1 &&
+    entries.slice(nextUser).some((entry) => entry.turnId === turnId)) return "";
+  const interval = entries.slice(firstUser + 1, nextUser === -1 ? undefined : nextUser);
+  if (turnId !== null && interval.some((entry) =>
+    entry.turnId !== undefined && entry.turnId !== turnId,
+  )) return "";
+
+  const chunks: string[] = [];
+  let messageId: string | undefined;
+  for (let index = interval.length - 1; index >= 0; index--) {
+    const entry = interval[index];
+    if (entry.item.type === "notification" || entry.item.type === "todo") {
+      if (chunks.length) break;
+      continue;
+    }
+    if (entry.item.type !== "assistant_message") break;
+    if (turnId !== null && entry.turnId !== turnId) return "";
+    if (chunks.length && messageId && entry.item.messageId !== messageId) break;
+    messageId ??= entry.item.messageId;
+    chunks.push(entry.item.text);
+  }
+  // Canonical assistant chunks are text deltas, not separate paragraphs.
+  const text = chunks.reverse().join("");
+  return text.trim() ? text : "";
 }
 
 export default function contribute(server: PluginServerContext) {
@@ -183,6 +238,7 @@ export default function contribute(server: PluginServerContext) {
   }
 
   async function prepareSource(invocation: AgentInvocation, context: PluginHookContext) {
+    if (invocation.sourceSummary?.ended || invocation.sourceTaskReady) return;
     if (needsSourceTask(invocation.configuration)) {
       await watchSource(invocation, context);
     } else {
@@ -224,6 +280,7 @@ export default function contribute(server: PluginServerContext) {
     task: string,
     context: PluginHookContext,
     via: "live" | "readback" | "turn_end",
+    cursor?: SourceTaskCursor,
   ) {
     if (
       !task.trim() ||
@@ -236,6 +293,7 @@ export default function contribute(server: PluginServerContext) {
       return;
     }
     invocation.sourceTaskReady = true;
+    invocation.sourceTaskCursor = cursor;
     if (invocation.configuration.prompt.includes("{{task_prompt}}")) {
       invocation.sourceTask = task;
     }
@@ -248,41 +306,34 @@ export default function contribute(server: PluginServerContext) {
     await startAgent(invocation, context);
   }
 
-  async function readSourceTask(
+  async function readSourcePages(
     invocation: AgentInvocation,
     context: PluginHookContext,
-    via: "live" | "readback" | "turn_end",
     isCurrent: () => boolean,
+    visit: (page: SourceTimelinePage) => void | Promise<void>,
+    canonical = false,
   ) {
-    const sourceAgentId = invocation.sourceAgentId;
-    if (!sourceAgentId) return;
-    const timeline = context.paseo.agents.ref(sourceAgentId).timeline;
-    type Page = Awaited<ReturnType<typeof timeline.refetch>>;
-    let cursor: NonNullable<Page["startCursor"]> | undefined;
-    let task: string | undefined;
+    if (!invocation.sourceAgentId) return;
+    const timeline = context.paseo.agents.ref(invocation.sourceAgentId).timeline;
+    let cursor: SourceTaskCursor | undefined;
+    let epoch: string | undefined;
     const seen = new Set<string>();
     while (isCurrent() && !context.signal.aborted) {
       const page = await timeline.refetch({
         direction: cursor ? "before" : "tail", limit: 100,
         ...(cursor ? { cursor } : {}),
+        ...(canonical ? { projection: "canonical" as const } : {}),
       });
       if (!isCurrent() || context.signal.aborted) return;
-      if (page.error) throw new Error(page.error);
-      if (cursor && page.startCursor && page.startCursor.epoch !== cursor.epoch) {
+      if (page.error) throw new Error("Source timeline read failed");
+      if (page.reset || page.staleCursor || page.gap ||
+        (epoch !== undefined && page.epoch !== epoch) ||
+        (cursor && page.startCursor && page.startCursor.epoch !== cursor.epoch)) {
         throw new Error("Source timeline changed during pagination");
       }
-      const first = page.entries.find(
-        (entry) => entry.item.type === "user_message" && entry.item.text.trim(),
-      );
-      if (first?.item.type === "user_message") task = first.item.text;
-      if (!page.hasOlder) {
-        if (task !== undefined) {
-          await sourceTaskAvailable(invocation, sourceAgentId, task, context, via);
-        } else if (via === "turn_end") {
-          log("source_task_unavailable", { workspaceId: invocation.workspace.id });
-        }
-        return;
-      }
+      epoch = page.epoch;
+      await visit(page);
+      if (!page.hasOlder) return;
       const next = page.startCursor;
       if (!next || seen.has(JSON.stringify(next)) ||
         (cursor && next.seq >= cursor.seq)) {
@@ -291,6 +342,112 @@ export default function contribute(server: PluginServerContext) {
       seen.add(JSON.stringify(next));
       cursor = next;
     }
+  }
+
+  async function readSourceTask(
+    invocation: AgentInvocation,
+    context: PluginHookContext,
+    via: "live" | "readback" | "turn_end",
+    isCurrent: () => boolean,
+  ) {
+    const sourceAgentId = invocation.sourceAgentId;
+    if (!sourceAgentId) return;
+    let task: string | undefined;
+    let cursor: SourceTaskCursor | undefined;
+    await readSourcePages(invocation, context, isCurrent, async (page) => {
+      const first = page.entries.find(
+        (entry) => entry.item.type === "user_message" && entry.item.text.trim(),
+      );
+      if (first?.item.type === "user_message") {
+        task = first.item.text;
+        cursor = page.epoch && Number.isInteger(first.seqStart)
+          ? { epoch: page.epoch, seq: first.seqStart } : undefined;
+      }
+      if (!page.hasOlder && isCurrent() && !context.signal.aborted) {
+        if (task !== undefined) {
+          await sourceTaskAvailable(invocation, sourceAgentId, task, context, via, cursor);
+        } else if (via === "turn_end") {
+          log("source_task_unavailable", { workspaceId: invocation.workspace.id });
+        }
+      }
+    });
+  }
+
+  async function finishSourceSummary(
+    invocation: AgentInvocation,
+    turnId: string | null,
+    outcome: "completed" | "failed" | "canceled",
+    context: PluginHookContext,
+  ) {
+    const summary = invocation.sourceSummary;
+    if (!summary || summary.ended || stopped || context.signal.aborted) return;
+    // Claim this terminal event before any await; stale live reads lose ownership.
+    summary.ended = true;
+    stopWatchingSource(invocation);
+    const skip = (reason: string) => {
+      invocation.phase = "finished";
+      invocation.abort.abort();
+      log("workspace_skipped", { workspaceId: invocation.workspace.id, reason });
+    };
+    if (summary.turnId != null && turnId !== summary.turnId) {
+      skip("source_turn_mismatch");
+      return;
+    }
+    if (outcome !== "completed") {
+      skip(`source_turn_${outcome}`);
+      return;
+    }
+    const isCurrent = () => !stopped && !context.signal.aborted &&
+      !invocation.abort.signal.aborted && invocation.phase === "waiting" &&
+      invocations.get(invocation.workspace.id) === invocation;
+    let reason = "empty_or_ambiguous";
+    try {
+      const pages: SourceTimelinePage[] = [];
+      await readSourcePages(invocation, context, isCurrent, (page) => {
+        pages.push(page);
+      }, true);
+      if (!isCurrent()) return;
+      if (!pages.length || pages.at(-1)!.hasOlder) throw new Error("Incomplete history");
+      const entries = pages.reverse().flatMap((page) => page.entries);
+      const firstUser = entries.findIndex((entry) =>
+        entry.item.type === "user_message" && entry.item.text.trim(),
+      );
+      const first = entries[firstUser];
+      const epoch = pages[0].epoch;
+      const cursor = first && epoch && Number.isInteger(first.seqStart)
+        ? { epoch, seq: first.seqStart } : undefined;
+      const original = invocation.sourceTaskCursor;
+      const sameTask = !invocation.sourceTaskReady || (original && cursor &&
+        original.epoch === cursor.epoch && original.seq === cursor.seq);
+      // Require stable ordered entries, not just a matching turn ID. The first
+      // fetched tail freezes the upper bound while older pages are read.
+      const ordered = cursor && entries.every((entry, index) =>
+        Number.isInteger(entry.seqStart) && Number.isInteger(entry.seqEnd) &&
+        entry.seqEnd >= entry.seqStart &&
+        (index === 0 || entry.seqStart > entries[index - 1].seqEnd),
+      );
+      if (first?.item.type === "user_message" && sameTask && ordered) {
+        await sourceTaskAvailable(invocation, invocation.sourceAgentId!,
+          first.item.text, context, "turn_end", cursor);
+        if (!isCurrent()) return;
+        summary.text = firstTurnReply(entries, firstUser, turnId, summary);
+      }
+    } catch {
+      // Provider errors can contain conversation text; log only a stable reason.
+      reason = "read_failed";
+    }
+    if (!isCurrent()) return;
+    summary.ready = true;
+    log(summary.text ? "source_summary_available" : "source_summary_unavailable", {
+      workspaceId: invocation.workspace.id,
+      sourceAgentId: invocation.sourceAgentId,
+      ...(summary.text ? {} : { reason }),
+    });
+    if (!invocation.sourceTaskReady) {
+      skip("source_context_unavailable");
+      return;
+    }
+    await startAgent(invocation, context);
   }
 
   async function watchSource(invocation: AgentInvocation, context: PluginHookContext) {
@@ -397,7 +554,8 @@ export default function contribute(server: PluginServerContext) {
       return;
     }
     if (!invocation.sourceAgentId ||
-      (needsSourceTask(invocation.configuration) && !invocation.sourceTaskReady)) {
+      (needsSourceTask(invocation.configuration) && !invocation.sourceTaskReady) ||
+      (invocation.sourceSummary && !invocation.sourceSummary.ready)) {
       return;
     }
     const prompt = renderPrompt(invocation.configuration.prompt, invocation);
@@ -501,6 +659,9 @@ export default function contribute(server: PluginServerContext) {
         agentId: randomUUID(),
         workspace,
         configuration,
+        ...(configuration.prompt.includes("{{source_summary}}") ? {
+          sourceSummary: { ended: false, ready: false, ambiguousTurn: false, text: "" },
+        } : {}),
         abort: new AbortController(),
         phase: "waiting",
       };
@@ -528,6 +689,14 @@ export default function contribute(server: PluginServerContext) {
     const workspaceId = event.agent.workspaceId;
     const invocation = workspaceId ? invocations.get(workspaceId) : null;
     if (invocation && selectSource(invocation, event.agent)) {
+      const summary = invocation.sourceSummary;
+      if (summary) {
+        if (summary.turnId === undefined && !summary.ended) {
+          summary.turnId = event.turnId ?? null;
+        } else if (!event.turnId || !summary.turnId || event.turnId === summary.turnId) {
+          summary.ambiguousTurn = true;
+        }
+      }
       await prepareSource(invocation, context);
     }
   });
@@ -538,6 +707,10 @@ export default function contribute(server: PluginServerContext) {
       const workspaceId = event.agent.workspaceId;
       const pending = workspaceId ? invocations.get(workspaceId) : null;
       if (!pending || !selectSource(pending, event.agent)) {
+        return;
+      }
+      if (pending.sourceSummary) {
+        await finishSourceSummary(pending, event.turnId ?? null, event.outcome.kind, context);
         return;
       }
       if (!needsSourceTask(pending.configuration)) {

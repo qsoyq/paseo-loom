@@ -91,6 +91,8 @@ flowchart TD
 
 ### workspace 创建与 Agent 调用
 
+下图展示不含 `{{source_summary}}` 的即时模板路径。含该占位符的模板还会等待来源首轮正常结束，具体规则见下文“来源首轮回复”。
+
 ```mermaid
 flowchart TD
     WorkspaceCreated["收到 workspace.created"] --> Active{"插件未停止且调用未取消？"}
@@ -129,7 +131,7 @@ flowchart TD
     Create -. "事件可能早于 SDK 请求返回" .-> Observe["按预登记的 workspace ID 与 Agent ID<br>进入下面的事件观察流程"]
 ```
 
-所有 prompt 都等待同一 workspace 的原任务根 Agent。普通 prompt 选中来源后即可发起调用，不读取用户任务；显式使用来源占位符时，还需等待来源的首条非空用户消息。SDK 请求返回与 Agent 事件没有固定先后顺序；请求失败也不代表规则一定没有执行，因此插件不会自动重试。
+所有 prompt 都等待同一 workspace 的原任务根 Agent。普通 prompt 选中来源后即可发起调用，不读取用户任务；显式使用来源占位符时，还需等待来源的首条非空用户消息。包含 `{{source_summary}}` 时还需等待来源首轮正常结束及回复读取完成，不做元指令识别。SDK 请求返回与 Agent 事件没有固定先后顺序；请求失败也不代表规则一定没有执行，因此插件不会自动重试。
 
 ### Agent 事件观察、归档与清理
 
@@ -241,10 +243,11 @@ Mode ID 是可选的。填写时插件通过 `config.modeId` 显式传入，适�
 | `{{workspace_title}}` | 创建事件中的 workspace 名称；为空时替换为空字符串 |
 | `{{source_agent_id}}` | 同一 workspace 中最先观察到的非本插件根 Agent 的稳定 ID，同时作为父 Agent；等其时间线出现用户任务后才传入 |
 | `{{task_prompt}}` | 该来源 Agent 时间线中的第一条非空用户消息；仅显式使用时才注入任务原文 |
+| `{{source_summary}}` | 来源首轮正常结束后的末尾 assistant 回复原文；显式使用时才等待首轮结束并注入，不另行调用模型生成摘要；不可用时为空 |
 
 占位符只替换一次，替换值不会被再次展开。其他占位符原样保留。如果替换后的 prompt 为空或仅含空白，插件也会跳过处理，避免创建没有指令的 Agent。
 
-所有模板都按稳定 workspace ID 观察非本插件根 Agent，忽略其他子 Agent，以确定处理 Agent 的父 Agent。普通 prompt 在来源出现后直接启动。仅当模板包含 `{{source_agent_id}}` 或 `{{task_prompt}}` 时，才订阅来源的实时用户消息并回读已存时间线，以填补订阅建立时的间隙；实时消息触发结构化回读，并按 `hasOlder` / `startCursor` 向前分页，确认整段历史中的首条非空用户消息后启动处理 Agent，**不等待整个回合结束**。分页失败、游标不前进或时间线 epoch 改变时不采用尾页中的后续消息。来源回合结束时也执行定向回读兜底，不依赖已弃用且始终为空的 `event.timeline`。只使用 `{{source_agent_id}}` 时，插件不把任务原文写入 prompt；若显式使用 `{{task_prompt}}`，才会将原文注入，可能影响提示词行为。不会按 cwd、项目名或标题匹配，也不扫描全局 Agent 列表；如果在启动前观察到多个来源候选，则停止，不猜测哪一个是原始任务。事件没有历史重放，错过关联事件或没有用户文本时不会伪造上下文。
+所有模板都按稳定 workspace ID 观察非本插件根 Agent，忽略其他子 Agent，以确定处理 Agent 的父 Agent。普通 prompt 在来源出现后直接启动。仅当模板包含 `{{source_agent_id}}`、`{{task_prompt}}` 或 `{{source_summary}}` 时，才订阅来源的实时用户消息并回读已存时间线，以填补订阅建立时的间隙；实时消息触发结构化回读，并按 `hasOlder` / `startCursor` 向前分页，确认整段历史中的首条非空用户消息。**没有 `{{source_summary}}` 时立即启动，不等待整个回合结束**；含该占位符时走下述延迟路径。分页失败、游标不前进或时间线 epoch 改变时不采用尾页中的后续消息。来源回合结束时也执行定向回读兜底，不依赖已弃用且始终为空的 `event.timeline`。只使用 `{{source_agent_id}}` 时，插件不把任务原文写入 prompt；若显式使用 `{{task_prompt}}`，才会将原文注入，可能影响提示词行为。不会按 cwd、项目名或标题匹配，也不扫描全局 Agent 列表；如果在启动前观察到多个来源候选，则停止，不猜测哪一个是原始任务。事件没有历史重放，错过关联事件或没有用户文本时不会伪造上下文。
 
 下面仅展示配置文本的结构，不是插件内置规则。请将最后一行替换为你实际希望 Agent 执行的规则，再将完整文本设置为 `PASEO_LOOM_PROMPT`：
 
@@ -270,20 +273,38 @@ Mode ID 是可选的。填写时插件通过 `config.modeId` 显式传入，适�
 <在这里填写处理范围、跳过条件及写入后按稳定 ID 回读的验收规则>
 ```
 
-完整自动命名示例见 [prompts/workspace-naming.md](prompts/workspace-naming.md)，需要手动保存到 Settings 的 Prompt，插件不会自动采用该文件。数据区块不是严格的安全隔离；实际权限仍由工具、provider 和 daemon 控制。只使用来源 ID 的模板仍然兼容，但不再推荐让模型从格式化日志提取任务。
+完整自动命名示例见 [prompts/workspace-naming.md](prompts/workspace-naming.md)。该示例包含 `{{source_summary}}`，普通任务和依赖聊天记录的任务都会等待首轮结束后再命名。需要手动保存到 Settings 的 Prompt，插件不会自动采用该文件。只使用来源 ID 的模板仍然兼容，但不再推荐让模型从格式化日志提取任务。
 
-在 Settings 保存 Prompt，或更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。
+在 Settings 保存 Prompt，或更新 `PASEO_LOOM_PROMPT` 并确保新值进入插件进程后，新 workspace 才能走这条上下文路径。已经启动的 Agent 不会收到事后补传的任务。恢复旧 Prompt 即可让之后创建的 workspace 恢复原启动时机；在途调用保持创建时的配置快照。
+
+### 来源首轮回复
+
+`{{source_summary}}` 是数据需求声明，不是自动判断任务信息量的开关。插件不增加分类模型或关键词规则，也不先运行一次命名再重试。
+
+- 只消费所选来源根 Agent 的首个终态事件，正常完成后用 SDK 回读 canonical 时间线；不使用已弃用的 `event.timeline`。首轮失败或取消则结束本次等待，不使用残缺回复，也不追等第二轮。
+- 从首条非空用户消息到下一条用户消息之间提取末尾 assistant 回复，结合 `turnId`、epoch 和消息序号确认范围；相同回复 ID 的连续分片按顺序保留，不包含工具结果或推理内容。回复 ID 不可用时仅采用末尾连续 assistant 文本。
+- `turnId` 缺失时，只在已观察到首轮开始、没有后续轮次开始或第二条用户消息时使用回复；轮次不匹配、ID 复用或边界不可靠时不猜测。分页游标不前进、历史缺口和 epoch 改变也不会采用局部结果。
+- 正常完成但回复为空或读取失败时，使用已确认的原始任务及空回复启动一次，由 Prompt 判断能否命名。连原始任务也无法确认时直接跳过，不轮询重试。权限等待不视为终态。
+- 重复事件不会创建第二个处理 Agent。来源或 workspace 归档、插件清理会取消尚未启动的调用；重载不恢复等待，也不补跑历史 workspace。
+
+### 模板与运行时隐私
+
+仓库命名模板只保存通用规则及占位符，不含真实姓名、账号、凭据、本机用户路径、会话 ID 或聊天记录，可以作为通用模板维护。不要将占位符展开后的 prompt、真实会话样本或个人 Settings 导出提交到仓库；测试使用合成数据。
+
+运行时数据不是公开模板：`{{task_prompt}}` 和 `{{source_summary}}` 会把原始任务及来源回复发送给配置的 handler provider/model，并进入该 handler 的会话历史；这些内容可能包含隐私或商业信息。插件不做自动脱敏，也不提供零留存保证。仅在信任目标 provider 和其数据处理方式时启用这些占位符。
+
+模板要求标题和结果报告不披露敏感信息，原始任务决定动作、来源回复只补充主题。此类 Prompt 约束和数据标签都不是安全沙箱，不能保证模型绝不泄露数据；实际权限仍由工具、provider 和 daemon 控制。新增摘要日志只记录状态、稳定原因及关联 ID，不记录回复正文或 provider 的原始读取异常。
 
 ## Agent 调用流程
 
 1. 收到 `workspace.created` 后，检查 workspace 是否已归档、调用是否已取消，以及当前进程是否已经处理该 workspace。
 2. 读取当前 Settings 快照；Settings 中为空的字段在兜底开启时读取对应环境变量，包括必需的权限模式 ID。缺少配置时立即跳过。
-3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。所有 prompt 都等待同一 workspace 的来源根 Agent；普通 prompt 选中来源后调用，使用来源占位符时等其首条用户消息可读后立即调用，不等待回合完成。
+3. 为本次调用分配 Agent ID，并先登记进程内的去重状态，防止重复或并发事件触发多次调用。所有 prompt 都等待同一 workspace 的来源根 Agent；普通 prompt 选中来源后调用，使用来源占位符时等待首条用户消息可读；包含 `{{source_summary}}` 时还要等待来源首轮正常结束及回复读取完成，其余模板立即调用。
 4. 通过 `context.paseo.workspaces.ref(workspace.id).agents.create(...)` 在准确的 workspace 中创建 Agent。配置中的 `provider` 使用 SDK 要求的 `provider/model` 格式；仅在 Mode ID 非空时传入 `config.modeId`，规则通过同一次创建请求的 `prompt` 传入，不再另发一次 `send()`。
 5. 创建请求同时传入 `parent: sourceAgentId` 和 `autoArchive: false`。Paseo 将其视为同一 workspace 的子 Agent，抑制自动打开标签页和用户通知，不向原任务发送完成消息。
 6. 按预先登记的 workspace ID 和 Agent ID 记录生命周期。仅由插件在完成、失败或取消时按处理 Agent ID 发起一次归档，覆盖回合结束早于创建请求返回的情况；不与宿主自动归档竞争，不归档原任务，也不清除原任务的未读状态。若插件在终态前被禁用、重载或事件丢失，子 Agent 可能保持未归档，需要按 ID 人工处理。
 
-来源 Agent 等待用户确认或权限、回合结束或取消，不会停止已经启动的处理子 Agent。来源归档只取消仍在等待任务文本的调用；处理子 Agent 的终态仍按它自己的 Agent ID 关联。插件不观察标题或 Git 分支变化，因此不能解决 Paseo 自动分支命名触发主 Agent 暂停的问题。
+来源 Agent 等待用户确认或权限、回合结束或取消，不会停止已经启动的处理子 Agent。来源归档只取消仍在等待任务文本或首轮回复的调用；处理子 Agent 的终态仍按它自己的 Agent ID 关联。插件不观察标题或 Git 分支变化，因此不能解决 Paseo 自动分支命名触发主 Agent 暂停的问题。
 
 来源订阅按每次观察的独立身份关联：释放或替换后，旧订阅的确认结果、消息及回读不能清理新订阅，也不能提供任务文本。历史回读失败会记录日志并保留实时订阅，但不会直接采用未确认历史边界的实时消息；后续实时消息、重连和回合结束可再次触发回读。订阅建立失败则释放该观察，保留后续来源事件和回合结束的定向回读兜底。
 
@@ -298,6 +319,8 @@ Mode ID 是可选的。填写时插件通过 `config.modeId` 显式传入，适�
 - `waiting_for_source` / `source_agent_selected`：所有模板均等待或选中同一 workspace 的根 Agent，作为父 Agent；不记录原始任务文本。
 - `source_task_available`：实时消息、定向回读或回合结束兜底确认任务已可读；日志只记录获取方式和来源 ID，不记录任务原文。
 - `source_task_unavailable` / `source_observation_failed`：尚无非空用户任务或实时订阅失败；后者保留回合结束兜底。
+- `source_summary_available` / `source_summary_unavailable`：来源首轮回复已读取或不可用；后者仅记录 `empty_or_ambiguous` / `read_failed`，不记录正文。
+- `workspace_skipped` 的 `source_turn_failed` / `source_turn_canceled` / `source_turn_mismatch` / `source_context_unavailable`：摘要路径的来源终态失败、取消、轮次不匹配或原始任务无法确认，不追等下一轮。
 - `source_ambiguous` / `source_archived`：多个来源候选或来源在任务可读前归档时停止，不猜测来源。
 - `agent_request_started`：已登记 Agent ID，开始提交创建与初始 prompt 请求。
 - `agent_created`：收到该 Agent 的创建事件，不代表规则已执行完成。
